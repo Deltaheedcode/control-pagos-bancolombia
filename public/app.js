@@ -86,16 +86,19 @@
 
     setTimeout(() => {
       try {
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
         const utter = new SpeechSynthesisUtterance(phrase);
         const voice = pickSpanishVoice();
         if (voice) utter.voice = voice;
         utter.lang = (voice && voice.lang) || 'es-CO';
-        utter.rate = 0.98;
+        utter.rate = 1.02;
         utter.pitch = 1.0;
         utter.volume = 1.0;
         window.speechSynthesis.speak(utter);
       } catch (_) {}
-    }, 340);
+    }, 160);
   }
 
   // --- GESTIÓN DE VISTAS LOGIN VS DASHBOARD ---
@@ -860,7 +863,7 @@
           }).catch(() => {});
         }
       }
-    }, 8 * 60 * 1000);
+    }, 4 * 60 * 1000);
 
     // Verificar si ya existe cookie de sesión activa al cargar la página
     try {

@@ -174,6 +174,9 @@ function createAppServer({
   app.use(express.static(path.join(__dirname, 'public')));
 
   const server = http.createServer(app);
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   const connectedClients = new Map();

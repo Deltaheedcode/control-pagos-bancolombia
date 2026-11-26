@@ -10,6 +10,9 @@ const PROVIDER_PRESETS = {
   yahoo: { host: 'imap.mail.yahoo.com', port: 993, secure: true }
 };
 
+// Pulso ultrarrápido cada 1.5s (~30 bytes por pulso) para evitar el retraso de 10-15s del IDLE de Gmail
+const TURBO_NOOP_INTERVAL_MS = 1500;
+
 function resolveImapConfig(settings) {
   const provider = (settings.email_provider || 'gmail').toLowerCase();
   const preset = PROVIDER_PRESETS[provider];
@@ -64,8 +67,11 @@ class EmailWatcher extends EventEmitter {
     this.client = null;
     this.running = false;
     this.scanning = false;
+    this.noopInFlight = false;
     this.pendingLiveCheck = false;
     this.lastSeenUid = 0;
+    this.lastKnownExists = 0;
+    this.tickCounter = 0;
     this.reconnectTimer = null;
     this.pollInterval = null;
     this.status = {
@@ -154,6 +160,7 @@ class EmailWatcher extends EventEmitter {
   async stop() {
     this.running = false;
     this.pendingLiveCheck = false;
+    this.noopInFlight = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -189,6 +196,8 @@ class EmailWatcher extends EventEmitter {
 
     this.running = true;
     this.lastSeenUid = 0;
+    this.lastKnownExists = 0;
+    this.tickCounter = 0;
     await this._connectLoop(cfg, settings);
   }
 
@@ -200,17 +209,17 @@ class EmailWatcher extends EventEmitter {
       message: `Conectando a ${cfg.user} (${cfg.host})...`
     });
 
-    // autoIdleDelay=800ms hace que entre en escucha instantánea IDLE casi de inmediato (<1s)
+    // disableAutoIdle=true evita perder viajes de red saliendo y entrando de IDLE;
+    // nuestro pulso NOOP cada 1.5s fuerza a Gmail/Hotmail a entregar nuevos mensajes al instante
     const client = new ImapFlow({
       host: cfg.host,
       port: cfg.port,
       secure: cfg.secure,
       auth: { user: cfg.user, pass: cfg.pass },
       logger: false,
-      autoIdleDelay: 800,
-      maxIdleTime: 240000,
-      connectionTimeout: 20000,
-      greetingTimeout: 15000
+      disableAutoIdle: true,
+      connectionTimeout: 18000,
+      greetingTimeout: 12000
     });
 
     this.client = client;
@@ -221,22 +230,25 @@ class EmailWatcher extends EventEmitter {
         state: 'error',
         message: translateImapError(err, cfg.provider)
       });
-      this._scheduleReconnect(8000);
+      this._scheduleReconnect(4000);
     });
 
     client.on('close', () => {
       if (!this.running || this.client !== client) return;
       this.setStatus({
         state: 'connecting',
-        message: 'Conexión IMAP renovándose automáticamente...'
+        message: 'Reconectando canal ultrarrápido de correo...'
       });
-      this._scheduleReconnect(3000);
+      this._scheduleReconnect(2000);
     });
 
-    // Notificación push instantánea del servidor de correo cuando entra un mensaje nuevo
-    client.on('exists', () => {
+    client.on('exists', (data) => {
       if (!this.running || this.client !== client) return;
-      this.checkNow({ isLiveEvent: true }).catch(() => {});
+      const newCount = data && typeof data.count === 'number' ? data.count : 0;
+      const prevCount = data && typeof data.prevCount === 'number' ? data.prevCount : this.lastKnownExists;
+      this.lastKnownExists = newCount;
+      const delta = Math.max(1, newCount - prevCount);
+      this.checkNow({ isLiveEvent: true, expectedNewCount: delta }).catch(() => {});
     });
 
     try {
@@ -246,6 +258,7 @@ class EmailWatcher extends EventEmitter {
       }
 
       const mailbox = await client.mailboxOpen('INBOX');
+      this.lastKnownExists = mailbox.exists || 0;
 
       const lookback = settings.sync_lookback || 'today';
       if (lookback === 'now' && mailbox.uidNext) {
@@ -254,24 +267,21 @@ class EmailWatcher extends EventEmitter {
 
       this.setStatus({
         state: 'connected',
-        message: `Monitoreando ${cfg.user} en tiempo real (IDLE instantáneo)`,
+        message: `Monitoreo Turbo activo en ${cfg.user} (revisión cada 1.5 s)`,
         lastCheckAt: new Date().toISOString()
       });
 
       await this.checkNow({ isInitialScan: true });
 
-      // Fijar el último UID conocido tras el escaneo inicial para que todo evento posterior sea directo
       if (client.mailbox && client.mailbox.uidNext) {
         this.lastSeenUid = Math.max(this.lastSeenUid, client.mailbox.uidNext - 1);
       }
 
-      // Respaldo cada 75s para no interrumpir constantemente el modo IDLE en tiempo real
+      // Bucle Turbo NOOP cada 1.5 segundos (solo ~30 bytes por pulso cuando no hay correo nuevo)
       if (this.pollInterval) clearInterval(this.pollInterval);
       this.pollInterval = setInterval(() => {
-        if (this.running && this.client === client && !this.scanning) {
-          this.checkNow({ isLiveEvent: true }).catch(() => {});
-        }
-      }, 75000);
+        this._turboPulse(client);
+      }, TURBO_NOOP_INTERVAL_MS);
     } catch (err) {
       if (this.client === client) {
         this.client = null;
@@ -288,8 +298,37 @@ class EmailWatcher extends EventEmitter {
 
       const isAuthErr = friendly.includes('rechazó');
       if (!isAuthErr && this.running) {
-        this._scheduleReconnect(10000);
+        this._scheduleReconnect(6000);
       }
+    }
+  }
+
+  async _turboPulse(client) {
+    if (!this.running || this.client !== client || !client.usable) return;
+    if (this.scanning || this.noopInFlight) return;
+
+    this.noopInFlight = true;
+    this.tickCounter += 1;
+
+    try {
+      // NOOP obliga a Gmail/Outlook a notificar nuevos mensajes en ~15-30ms sin esperar el batching de IDLE
+      await client.noop();
+
+      const currentExists = (client.mailbox && client.mailbox.exists) || 0;
+      const countIncreased = currentExists > this.lastKnownExists;
+      this.lastKnownExists = currentExists;
+
+      // Si creció el conteo (y 'exists' aún no disparó escaneo) o cada 2 pulsos (3s) verificar rango de UIDs nuevos
+      if ((countIncreased || this.tickCounter % 2 === 0) && !this.scanning) {
+        await this.checkNow({
+          isLiveEvent: true,
+          expectedNewCount: countIncreased ? 1 : 0
+        });
+      }
+    } catch (_) {
+      // Si el socket cayó silenciosamente, el evento error/close reconectará
+    } finally {
+      this.noopInFlight = false;
     }
   }
 
@@ -309,7 +348,78 @@ class EmailWatcher extends EventEmitter {
     }, delayMs);
   }
 
-  async checkNow({ isInitialScan = false, isLiveEvent = false, manual = false } = {}) {
+  async _processFetchedMessage(msg, { officialSenders, isLiveEvent, manual, isInitialScan }) {
+    const envelopeMsgId =
+      msg.envelope && msg.envelope.messageId
+        ? String(msg.envelope.messageId).trim()
+        : `imap-uid-${msg.uid}`;
+
+    if (db.hasMessageId(envelopeMsgId)) return 0;
+
+    const envFrom =
+      msg.envelope &&
+      Array.isArray(msg.envelope.from) &&
+      msg.envelope.from[0] &&
+      msg.envelope.from[0].address
+        ? String(msg.envelope.from[0].address).toLowerCase()
+        : '';
+
+    if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
+      return 0;
+    }
+
+    const parsed = await simpleParser(msg.source);
+    const fromObj =
+      parsed.from && Array.isArray(parsed.from.value) && parsed.from.value[0]
+        ? parsed.from.value[0]
+        : { address: envFrom, name: '' };
+
+    const messageId = (parsed.messageId || envelopeMsgId).trim();
+    if (db.hasMessageId(messageId)) return 0;
+
+    const analysis = parser.analyzeEmailForPayment({
+      fromAddress: fromObj.address,
+      fromName: fromObj.name,
+      subject: parsed.subject,
+      textBody: parsed.text,
+      htmlBody: parsed.html,
+      date: parsed.date || msg.internalDate || new Date(),
+      messageId,
+      headers: parsed.headers,
+      officialSenders
+    });
+
+    if (analysis.accepted) {
+      const { inserted, payment } = db.insertPayment(analysis.payment, false);
+      if (inserted && payment) {
+        const ageMs = Date.now() - new Date(payment.received_at).getTime();
+        const shouldSpeak = isLiveEvent || manual || !isInitialScan || ageMs < 180000;
+        this.emit('payment', { payment, announceVoice: shouldSpeak });
+        return 1;
+      }
+    } else if (analysis.reason !== 'unauthorized_sender') {
+      db.logAuditEvent({
+        fromEmail: fromObj.address,
+        subject: parsed.subject,
+        reason: analysis.reason,
+        detail: analysis.reasonDetail
+      });
+      this.emit('audit', {
+        fromEmail: fromObj.address,
+        subject: parsed.subject,
+        reason: analysis.reason,
+        detail: analysis.reasonDetail
+      });
+    }
+    return 0;
+  }
+
+  async checkNow({
+    isInitialScan = false,
+    isLiveEvent = false,
+    manual = false,
+    expectedNewCount = 0
+  } = {}) {
     if (!this.client || !this.client.usable) {
       if (manual) {
         await this.restart();
@@ -333,18 +443,33 @@ class EmailWatcher extends EventEmitter {
       const officialSenders = parser.normalizeSenderList(settings.official_senders);
       const lookback = settings.sync_lookback || 'today';
 
-      let candidateUids = [];
-
       if (this.lastSeenUid > 0 && !manual) {
-        // Vía rápida directa en 1 solo viaje de red: leer sobres desde lastSeenUid + 1 sin SEARCH previo
-        const matchingNewUids = [];
-        const currentMaxNext = this.client.mailbox && this.client.mailbox.uidNext
-          ? this.client.mailbox.uidNext
-          : this.lastSeenUid + 1;
+        // Rango superior explícito 4294967295 (RFC 3501): devuelve 0 mensajes instantáneamente si no hay UID > lastSeenUid,
+        // y si llegó correo nuevo lo trae de inmediato sin depender del viejo mailbox.uidNext
+        const uidRange = `${this.lastSeenUid + 1}:4294967295`;
 
-        if (currentMaxNext > this.lastSeenUid) {
+        if (expectedNewCount > 0 && expectedNewCount <= 3) {
+          // VÍA EXPRÉS EN 1 SOLO VIAJE DE RED: traer sobre + cuerpo directamente
+          for await (const msg of this.client.fetch(
+            uidRange,
+            { uid: true, envelope: true, source: true, internalDate: true },
+            { uid: true }
+          )) {
+            if (msg.uid <= this.lastSeenUid) continue;
+            this.lastSeenUid = Math.max(this.lastSeenUid, msg.uid);
+            checked += 1;
+            added += await this._processFetchedMessage(msg, {
+              officialSenders,
+              isLiveEvent,
+              manual,
+              isInitialScan
+            });
+          }
+        } else {
+          // Chequeo silencioso de respaldo: traer solo sobres livianos primero
+          const candidateUids = [];
           for await (const envMsg of this.client.fetch(
-            `${this.lastSeenUid + 1}:*`,
+            uidRange,
             { uid: true, envelope: true },
             { uid: true }
           )) {
@@ -356,7 +481,6 @@ class EmailWatcher extends EventEmitter {
               envMsg.envelope && envMsg.envelope.messageId
                 ? String(envMsg.envelope.messageId).trim()
                 : `imap-uid-${envMsg.uid}`;
-
             if (db.hasMessageId(envMsgId)) continue;
 
             const envFrom =
@@ -367,13 +491,25 @@ class EmailWatcher extends EventEmitter {
                 ? String(envMsg.envelope.from[0].address).toLowerCase()
                 : '';
 
-            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
-              continue;
+            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) continue;
+            candidateUids.push(envMsg.uid);
+          }
+
+          if (candidateUids.length > 0) {
+            for await (const msg of this.client.fetch(
+              candidateUids,
+              { uid: true, envelope: true, source: true, internalDate: true },
+              { uid: true }
+            )) {
+              added += await this._processFetchedMessage(msg, {
+                officialSenders,
+                isLiveEvent,
+                manual,
+                isInitialScan
+              });
             }
-            matchingNewUids.push(envMsg.uid);
           }
         }
-        candidateUids = matchingNewUids;
       } else {
         // Escaneo inicial o manual por fecha
         const sinceDate = new Date();
@@ -401,7 +537,6 @@ class EmailWatcher extends EventEmitter {
               envMsg.envelope && envMsg.envelope.messageId
                 ? String(envMsg.envelope.messageId).trim()
                 : `imap-uid-${envMsg.uid}`;
-
             if (db.hasMessageId(envMsgId)) continue;
 
             const envFrom =
@@ -412,87 +547,33 @@ class EmailWatcher extends EventEmitter {
                 ? String(envMsg.envelope.from[0].address).toLowerCase()
                 : '';
 
-            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
-              continue;
-            }
+            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) continue;
             filtered.push(envMsg.uid);
           }
-          candidateUids = filtered;
-        }
-      }
 
-      // Descargar cuerpo completo ÚNICAMENTE de los mensajes del remitente oficial autorizado
-      if (candidateUids.length > 0) {
-        for await (const msg of this.client.fetch(
-          candidateUids,
-          { uid: true, envelope: true, source: true, internalDate: true },
-          { uid: true }
-        )) {
-          const envelopeMsgId =
-            msg.envelope && msg.envelope.messageId
-              ? String(msg.envelope.messageId).trim()
-              : `imap-uid-${msg.uid}`;
-
-          if (db.hasMessageId(envelopeMsgId)) continue;
-
-          const parsed = await simpleParser(msg.source);
-          const envFrom =
-            msg.envelope &&
-            Array.isArray(msg.envelope.from) &&
-            msg.envelope.from[0] &&
-            msg.envelope.from[0].address
-              ? String(msg.envelope.from[0].address).toLowerCase()
-              : '';
-
-          const fromObj =
-            parsed.from && Array.isArray(parsed.from.value) && parsed.from.value[0]
-              ? parsed.from.value[0]
-              : { address: envFrom, name: '' };
-
-          const messageId = (parsed.messageId || envelopeMsgId).trim();
-          if (db.hasMessageId(messageId)) continue;
-
-          const analysis = parser.analyzeEmailForPayment({
-            fromAddress: fromObj.address,
-            fromName: fromObj.name,
-            subject: parsed.subject,
-            textBody: parsed.text,
-            htmlBody: parsed.html,
-            date: parsed.date || msg.internalDate || new Date(),
-            messageId,
-            headers: parsed.headers,
-            officialSenders
-          });
-
-          if (analysis.accepted) {
-            const { inserted, payment } = db.insertPayment(analysis.payment, false);
-            if (inserted && payment) {
-              added += 1;
-              const ageMs = Date.now() - new Date(payment.received_at).getTime();
-              const shouldSpeak = isLiveEvent || manual || !isInitialScan || ageMs < 180000;
-              this.emit('payment', { payment, announceVoice: shouldSpeak });
+          if (filtered.length > 0) {
+            for await (const msg of this.client.fetch(
+              filtered,
+              { uid: true, envelope: true, source: true, internalDate: true },
+              { uid: true }
+            )) {
+              added += await this._processFetchedMessage(msg, {
+                officialSenders,
+                isLiveEvent,
+                manual,
+                isInitialScan
+              });
             }
-          } else if (analysis.reason !== 'unauthorized_sender') {
-            db.logAuditEvent({
-              fromEmail: fromObj.address,
-              subject: parsed.subject,
-              reason: analysis.reason,
-              detail: analysis.reasonDetail
-            });
-            this.emit('audit', {
-              fromEmail: fromObj.address,
-              subject: parsed.subject,
-              reason: analysis.reason,
-              detail: analysis.reasonDetail
-            });
           }
         }
       }
 
-      this.setStatus({
-        state: 'connected',
-        lastCheckAt: new Date().toISOString()
-      });
+      if (checked > 0 || manual || isInitialScan) {
+        this.setStatus({
+          state: 'connected',
+          lastCheckAt: new Date().toISOString()
+        });
+      }
     } catch (err) {
       const settings = db.getAllSettings(true);
       const cfg = resolveImapConfig(settings);
@@ -505,7 +586,7 @@ class EmailWatcher extends EventEmitter {
       if (this.pendingLiveCheck && this.running) {
         this.pendingLiveCheck = false;
         setImmediate(() => {
-          this.checkNow({ isLiveEvent: true }).catch(() => {});
+          this.checkNow({ isLiveEvent: true, expectedNewCount: 1 }).catch(() => {});
         });
       }
     }
