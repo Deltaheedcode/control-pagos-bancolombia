@@ -8,8 +8,8 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 const VAULT_KEY_PATH = path.join(DATA_DIR, '.vault.key');
-const SESSION_COOKIE_NAME = 'bcol_auth_session';
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días de sesión continua
+const SESSION_COOKIE_NAME = 'bcol_strict_session_v2';
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 horas máximo en memoria activa
 
 // Parámetros criptográficos de alto costo contra fuerza bruta (scrypt)
 const SCRYPT_PARAMS = {
@@ -264,7 +264,9 @@ function decryptSecret(storedValue) {
   }
 }
 
-// --- SESIONES FIRMADAS HMAC-SHA256 CON ROL ---
+// --- SESIONES ESTRICTAS DE INSTANCIA ÚNICA POR CUENTA (1 USUARIO = 1 NAVEGADOR ACTIVO) ---
+// Mapa en servidor: accountId -> jti activo actual. Cualquier token anterior queda invalidado al instante.
+const activeSessionByAccount = new Map();
 const revokedJtis = new Map();
 
 function cleanupRevoked() {
@@ -277,11 +279,23 @@ function cleanupRevoked() {
 function createSessionToken(accountInfo = {}, ttlMs = SESSION_TTL_MS) {
   const now = Date.now();
   const role = accountInfo.role === 'viewer' ? 'viewer' : 'admin';
+  const accountId = String(accountInfo.accountId || role);
+  const jti = crypto.randomBytes(16).toString('hex');
+
+  // Revocar inmediatamente cualquier sesión previa de esta misma cuenta en otro navegador/dispositivo
+  const previousJti = activeSessionByAccount.get(accountId);
+  if (previousJti && previousJti !== jti) {
+    cleanupRevoked();
+    revokedJtis.set(previousJti, now + ttlMs);
+  }
+  activeSessionByAccount.set(accountId, jti);
+
   const payload = {
+    ver: 2,
     role,
-    accountId: accountInfo.accountId || role,
+    accountId,
     label: accountInfo.label || (role === 'viewer' ? 'Celular' : 'Administrador'),
-    jti: crypto.randomBytes(16).toString('hex'),
+    jti,
     iat: now,
     exp: now + ttlMs
   };
@@ -291,15 +305,20 @@ function createSessionToken(accountInfo = {}, ttlMs = SESSION_TTL_MS) {
     .update(payloadB64)
     .digest('base64url');
 
-  return `${payloadB64}.${sig}`;
+  return { token: `${payloadB64}.${sig}`, jti, previousJti: previousJti || null, accountId };
 }
 
 function verifySessionToken(token) {
+  const checked = inspectSessionToken(token);
+  return checked.valid ? checked.payload : null;
+}
+
+function inspectSessionToken(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) {
-    return null;
+    return { valid: false, reason: 'missing' };
   }
   const parts = token.split('.');
-  if (parts.length !== 2) return null;
+  if (parts.length !== 2) return { valid: false, reason: 'malformed' };
 
   const [payloadB64, sigB64] = parts;
   const expectedSig = crypto
@@ -311,40 +330,53 @@ function verifySessionToken(token) {
   try {
     providedSig = Buffer.from(sigB64, 'base64url');
   } catch (_) {
-    return null;
+    return { valid: false, reason: 'bad_sig' };
   }
 
   if (
     providedSig.length !== expectedSig.length ||
     !crypto.timingSafeEqual(providedSig, expectedSig)
   ) {
-    return null;
+    return { valid: false, reason: 'bad_sig' };
   }
 
   try {
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
     if (
       !payload ||
+      payload.ver !== 2 ||
+      !payload.accountId ||
       (payload.role !== 'admin' && payload.role !== 'viewer') ||
       !payload.exp ||
       Date.now() > payload.exp
     ) {
-      return null;
+      return { valid: false, reason: 'expired' };
     }
     if (payload.jti && revokedJtis.has(payload.jti)) {
-      return null;
+      return { valid: false, reason: 'replaced' };
     }
-    return payload;
+    // Exigir que el jti coincida exactamente con la única sesión activa registrada en el servidor para esa cuenta
+    const currentActiveJti = activeSessionByAccount.get(payload.accountId);
+    if (!currentActiveJti || currentActiveJti !== payload.jti) {
+      return { valid: false, reason: 'replaced' };
+    }
+    return { valid: true, payload };
   } catch (_) {
-    return null;
+    return { valid: false, reason: 'corrupt' };
   }
 }
 
 function revokeSessionToken(token) {
-  const payload = verifySessionToken(token);
-  if (payload && payload.jti) {
-    cleanupRevoked();
-    revokedJtis.set(payload.jti, payload.exp);
+  const checked = inspectSessionToken(token);
+  if (checked.valid && checked.payload) {
+    const { jti, accountId, exp } = checked.payload;
+    if (jti) {
+      cleanupRevoked();
+      revokedJtis.set(jti, exp);
+    }
+    if (accountId && activeSessionByAccount.get(accountId) === jti) {
+      activeSessionByAccount.delete(accountId);
+    }
   }
 }
 
@@ -448,6 +480,7 @@ module.exports = {
   decryptSecret,
   createSessionToken,
   verifySessionToken,
+  inspectSessionToken,
   revokeSessionToken,
   parseCookies,
   LoginRateLimiter

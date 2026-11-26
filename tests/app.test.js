@@ -160,22 +160,55 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
     });
     assert.equal(lockedResp.status, 429);
 
-    // 4. Inicio de sesión legítimo de Admin y de los 2 Celulares
+    // 4. Inicio de sesión legítimo de Admin y prueba de SESIÓN ÚNICA (abrir en otro navegador cierra la anterior)
+    const loginBrowser1 = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.10' },
+      body: JSON.stringify({ username: 'ADMIN_TEST', password: 'ClaveEfimeraAdmin#99' })
+    });
+    assert.equal(loginBrowser1.status, 200);
+    const cookieBrowser1 = loginBrowser1.headers.getSetCookie()[0].split(';')[0];
+
+    const wsBrowser1 = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+      headers: { Cookie: cookieBrowser1 }
+    });
+    await new Promise((resolve, reject) => {
+      wsBrowser1.once('open', resolve);
+      wsBrowser1.once('error', reject);
+    });
+
+    const wsBrowser1ClosedPromise = new Promise((resolve) => {
+      wsBrowser1.once('close', (code) => resolve(code));
+    });
+
+    // Ahora el mismo usuario ADMIN_TEST inicia sesión en un SEGUNDO navegador
     const loginResp = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Forwarded-For': '198.51.100.10'
+        'X-Forwarded-For': '198.51.100.20'
       },
       body: JSON.stringify({ username: 'ADMIN_TEST', password: 'ClaveEfimeraAdmin#99' })
     });
     assert.equal(loginResp.status, 200);
     const loginAdminJson = await loginResp.json();
     assert.equal(loginAdminJson.role, 'admin');
-    const setCookie = loginResp.headers.get('set-cookie') || '';
-    assert.match(setCookie, /HttpOnly/i);
-    const cookieHeader = setCookie.split(';')[0];
+    const setCookiesAdmin = loginResp.headers.getSetCookie();
+    assert.match(setCookiesAdmin[0], /HttpOnly/i);
+    const cookieHeader = setCookiesAdmin[0].split(';')[0];
 
+    // El navegador 1 debe ser expulsado inmediatamente por WebSocket (4002) y por HTTP (401 sessionReplaced)
+    const closedCode = await wsBrowser1ClosedPromise;
+    assert.equal(closedCode, 4002);
+
+    const kickedHttpResp = await fetch(`${baseUrl}/api/state`, {
+      headers: { Cookie: cookieBrowser1 }
+    });
+    assert.equal(kickedHttpResp.status, 401);
+    const kickedJson = await kickedHttpResp.json();
+    assert.equal(kickedJson.sessionReplaced, true);
+
+    // Iniciar sesión en los 2 Celulares independientes
     const cel1Resp = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.11' },
@@ -184,7 +217,7 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
     assert.equal(cel1Resp.status, 200);
     const cel1Json = await cel1Resp.json();
     assert.equal(cel1Json.role, 'viewer');
-    const cel1Cookie = (cel1Resp.headers.get('set-cookie') || '').split(';')[0];
+    const cel1Cookie = cel1Resp.headers.getSetCookie()[0].split(';')[0];
 
     const cel2Resp = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
@@ -192,7 +225,7 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
       body: JSON.stringify({ username: 'CEL2_TEST', password: 'ClaveEfimeraCel2#99' })
     });
     assert.equal(cel2Resp.status, 200);
-    const cel2Cookie = (cel2Resp.headers.get('set-cookie') || '').split(';')[0];
+    const cel2Cookie = cel2Resp.headers.getSetCookie()[0].split(';')[0];
 
     // Verificar que los celulares (viewer) NO tienen acceso a configuración, simulador, QR ni borrado (403 Forbidden)
     const forbiddenSettings = await fetch(`${baseUrl}/api/settings`, {

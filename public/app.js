@@ -104,7 +104,7 @@
   }
 
   // --- GESTIÓN DE VISTAS LOGIN VS DASHBOARD ---
-  function showLoginScreen() {
+  function showLoginScreen(customMessage = '') {
     state.authenticated = false;
     if (state.wsReconnectTimer) {
       clearTimeout(state.wsReconnectTimer);
@@ -119,6 +119,14 @@
     document.getElementById('appRoot').classList.add('hidden');
     document.getElementById('loginScreen').classList.remove('hidden');
     document.getElementById('loginPass').value = '';
+
+    const errEl = document.getElementById('loginError');
+    if (customMessage) {
+      errEl.textContent = customMessage;
+      errEl.classList.remove('hidden');
+    } else {
+      errEl.classList.add('hidden');
+    }
   }
 
   function applyRolePermissions() {
@@ -173,7 +181,7 @@
 
     const data = await resp.json().catch(() => ({}));
     if (resp.status === 401 && data && data.authRequired) {
-      showLoginScreen();
+      showLoginScreen(data.sessionReplaced ? data.error : '');
       return null;
     }
     return data;
@@ -485,6 +493,13 @@
     ws.addEventListener('message', (ev) => {
       try {
         const msg = JSON.parse(ev.data);
+        if (msg.type === 'session_replaced') {
+          showLoginScreen(
+            msg.message ||
+              '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+          );
+          return;
+        }
         if (msg.type === 'new_payment' && msg.payment) {
           if (msg.encryptedVault) {
             localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
@@ -534,6 +549,18 @@
     });
 
     ws.addEventListener('close', (ev) => {
+      if (ev.code === 4002) {
+        showLoginScreen(
+          '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+        );
+        return;
+      }
+      if (ev.code === 4003) {
+        showLoginScreen(
+          '🔒 Tu sesión se trasladó a una pestaña más reciente en este dispositivo.'
+        );
+        return;
+      }
       if (ev.code === 4001) {
         showLoginScreen();
         return;
@@ -914,6 +941,20 @@
         }
       }
     }, 4 * 60 * 1000);
+
+    // Si viene desde escaneo de código QR (?login=1), limpiar cualquier cookie previa en ese teléfono y exigir login obligatorio
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('login') === '1') {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin'
+      }).catch(() => {});
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState({}, '', window.location.pathname || '/');
+      }
+      showLoginScreen();
+      return;
+    }
 
     // Verificar si ya existe cookie de sesión activa al cargar la página
     try {

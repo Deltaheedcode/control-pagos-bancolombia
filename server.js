@@ -134,18 +134,22 @@ function isSecureRequest(req) {
   return proto.includes('https');
 }
 
-function buildSessionCookieHeader(token, maxAgeSeconds, secureFlag) {
-  const parts = [
-    `${security.SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
-    'HttpOnly',
-    'Path=/',
-    `Max-Age=${maxAgeSeconds}`,
-    'SameSite=Lax'
-  ];
-  if (secureFlag) {
-    parts.push('Secure');
+function buildSessionCookieHeaders(token, clearFlag, secureFlag) {
+  const securePart = secureFlag ? '; Secure' : '';
+  const clearLegacy = `bcol_auth_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict${securePart}`;
+
+  if (clearFlag || !token) {
+    return [
+      `${security.SESSION_COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict${securePart}`,
+      clearLegacy
+    ];
   }
-  return parts.join('; ');
+
+  // Cookie de sesión estricta (sin Max-Age persistente en disco y SameSite=Strict)
+  return [
+    `${security.SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Strict${securePart}`,
+    clearLegacy
+  ];
 }
 
 // Ocultar información sensible (correos, servidores, remitentes internos) a usuarios viewer (celulares)
@@ -225,9 +229,10 @@ function createAppServer({
   const connectedClients = new Map();
 
   function getDevicesList() {
-    const arr = [];
+    const byAccount = new Map();
     for (const [id, info] of connectedClients.entries()) {
-      arr.push({
+      const key = info.accountId || id;
+      byAccount.set(key, {
         id,
         name: info.accountLabel ? `${info.accountLabel} (${info.name})` : info.name,
         role: info.role,
@@ -236,7 +241,7 @@ function createAppServer({
         connectedAt: info.connectedAt
       });
     }
-    return arr;
+    return Array.from(byAccount.values());
   }
 
   function broadcastByRole(buildPayloadForRole) {
@@ -263,45 +268,58 @@ function createAppServer({
     );
   }
 
-  function getVerifiedSessionFromReq(req) {
+  function inspectReqSession(req) {
     const cookies = security.parseCookies(req.headers.cookie);
     const token = cookies[security.SESSION_COOKIE_NAME];
-    if (!token) return null;
-    const payload = security.verifySessionToken(token);
-    if (!payload) return null;
-    return { token, payload };
+    if (!token) return { valid: false, reason: 'missing' };
+    const checked = security.inspectSessionToken(token);
+    if (!checked.valid) return checked;
+    return { valid: true, token, payload: checked.payload };
+  }
+
+  function getVerifiedSessionFromReq(req) {
+    const res = inspectReqSession(req);
+    return res.valid ? { token: res.token, payload: res.payload } : null;
   }
 
   function requireAuth(req, res, next) {
-    const session = getVerifiedSessionFromReq(req);
-    if (!session) {
+    const check = inspectReqSession(req);
+    if (!check.valid) {
+      const replaced = check.reason === 'replaced';
       return res.status(401).json({
         ok: false,
         authRequired: true,
-        error: 'Acceso restringido. Debes iniciar sesión.'
+        sessionReplaced: replaced,
+        error: replaced
+          ? 'Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+          : 'Acceso restringido. Debes iniciar sesión.'
       });
     }
-    req.userSession = session;
+    req.userSession = { token: check.token, payload: check.payload };
     return next();
   }
 
   function requireAdmin(req, res, next) {
-    const session = getVerifiedSessionFromReq(req);
-    if (!session) {
+    const check = inspectReqSession(req);
+    if (!check.valid) {
+      const replaced = check.reason === 'replaced';
       return res.status(401).json({
         ok: false,
         authRequired: true,
-        error: 'Acceso restringido. Debes iniciar sesión.'
+        sessionReplaced: replaced,
+        error: replaced
+          ? 'Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+          : 'Acceso restringido. Debes iniciar sesión.'
       });
     }
-    if (session.payload.role !== 'admin') {
+    if (check.payload.role !== 'admin') {
       return res.status(403).json({
         ok: false,
         forbidden: true,
         error: 'Permiso denegado: esta función es exclusiva del Administrador.'
       });
     }
-    req.userSession = session;
+    req.userSession = { token: check.token, payload: check.payload };
     return next();
   }
 
@@ -347,15 +365,34 @@ function createAppServer({
     }
 
     loginLimiter.reset(ip);
-    const token = security.createSessionToken({
+    const sessionData = security.createSessionToken({
       role: check.role,
       accountId: check.accountId,
       label: check.label
     });
-    const maxAgeSec = Math.floor(security.SESSION_TTL_MS / 1000);
+
+    // Expulsar en tiempo real cualquier sesión anterior abierta con este mismo usuario en otro navegador/teléfono
+    for (const [clientId, entry] of connectedClients.entries()) {
+      if (entry.accountId === sessionData.accountId && entry.sessionToken !== sessionData.token) {
+        try {
+          if (entry.ws.readyState === 1) {
+            entry.ws.send(
+              JSON.stringify({
+                type: 'session_replaced',
+                message: '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+              })
+            );
+          }
+          entry.ws.close(4002, 'Sesión iniciada en otro navegador');
+        } catch (_) {}
+        connectedClients.delete(clientId);
+      }
+    }
+    broadcastDevicesToAdmins();
+
     res.setHeader(
       'Set-Cookie',
-      buildSessionCookieHeader(token, maxAgeSec, isSecureRequest(req))
+      buildSessionCookieHeaders(sessionData.token, false, isSecureRequest(req))
     );
 
     return res.json({
@@ -384,7 +421,7 @@ function createAppServer({
 
     res.setHeader(
       'Set-Cookie',
-      buildSessionCookieHeader('', 0, isSecureRequest(req))
+      buildSessionCookieHeaders('', true, isSecureRequest(req))
     );
     res.json({ ok: true, authenticated: false });
   });
@@ -489,7 +526,8 @@ function createAppServer({
 
     if (cloudExternalUrl) {
       const cleanUrl = cloudExternalUrl.replace(/\/+$/, '');
-      const qrDataUrl = await QRCode.toDataURL(cleanUrl, {
+      const qrLoginUrl = `${cleanUrl}/?login=1`;
+      const qrDataUrl = await QRCode.toDataURL(qrLoginUrl, {
         margin: 1,
         width: 280,
         color: { dark: '#0F172A', light: '#FFFFFF' }
@@ -525,7 +563,7 @@ function createAppServer({
         isVirtual: false
       };
 
-    const qrDataUrl = await QRCode.toDataURL(primary.url, {
+    const qrDataUrl = await QRCode.toDataURL(`${primary.url}/?login=1`, {
       margin: 1,
       width: 280,
       color: { dark: '#0F172A', light: '#FFFFFF' }
@@ -705,9 +743,28 @@ function createAppServer({
         ? 'Android'
         : 'PC';
 
+    // Si la misma cuenta abre otra pestaña o reconecta, cerrar el socket viejo para garantizar 1 sola conexión viva por usuario
+    for (const [oldId, oldEntry] of connectedClients.entries()) {
+      if (oldEntry.accountId === verified.accountId) {
+        try {
+          if (oldEntry.sessionToken !== token && oldEntry.ws.readyState === 1) {
+            oldEntry.ws.send(
+              JSON.stringify({
+                type: 'session_replaced',
+                message: '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+              })
+            );
+          }
+          oldEntry.ws.close(oldEntry.sessionToken !== token ? 4002 : 4003, 'Reemplazada por conexión más reciente');
+        } catch (_) {}
+        connectedClients.delete(oldId);
+      }
+    }
+
     const clientEntry = {
       ws,
       sessionToken: token,
+      accountId: verified.accountId,
       role: verified.role,
       accountLabel: verified.label,
       isAlive: true,
