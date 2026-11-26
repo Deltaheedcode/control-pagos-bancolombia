@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: control-pagos-bancolombia
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: EMAIL_USER
+        value: jhocamza@gmail.com
+      - key: OFFICIAL_SENDERS
+        value: jhocamza@gmail.com
