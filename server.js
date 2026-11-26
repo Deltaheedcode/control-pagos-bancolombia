@@ -201,9 +201,14 @@ function createAppServer({
   authConfig = security.DEFAULT_ACCOUNTS
 } = {}) {
   const app = express();
-  const loginLimiter = new security.LoginRateLimiter({
-    maxAttempts: 5,
-    windowMs: 15 * 60 * 1000
+  // Límite por cuenta+IP (para no bloquear otros celulares/PC en el mismo Wi-Fi) + tope global anti-bots por IP
+  const accountLimiter = new security.LoginRateLimiter({
+    maxAttempts: 8,
+    windowMs: 10 * 60 * 1000
+  });
+  const ipFloodLimiter = new security.LoginRateLimiter({
+    maxAttempts: 25,
+    windowMs: 10 * 60 * 1000
   });
 
   app.disable('x-powered-by');
@@ -343,28 +348,33 @@ function createAppServer({
 
   app.post('/api/auth/login', async (req, res) => {
     const ip = extractClientIp(req);
-    const rateCheck = loginLimiter.check(ip);
-    if (rateCheck.blocked) {
-      const mins = Math.ceil(rateCheck.retryAfterSeconds / 60);
+    const { username, password } = req.body || {};
+    const normUserKey = `${ip}:${security.normalizeUsernameInput(username).slice(0, 24) || 'empty'}`;
+
+    const ipCheck = ipFloodLimiter.check(ip);
+    const accCheck = accountLimiter.check(normUserKey);
+    if (ipCheck.blocked || accCheck.blocked) {
+      const retrySec = ipCheck.blocked ? ipCheck.retryAfterSeconds : accCheck.retryAfterSeconds;
+      const mins = Math.ceil(retrySec / 60);
       return res.status(429).json({
         ok: false,
-        error: `Demasiados intentos fallidos. Acceso bloqueado temporalmente por ${mins} minuto(s) por seguridad.`
+        error: `Demasiados intentos fallidos para este usuario. Espera ${mins} minuto(s) e intenta de nuevo.`
       });
     }
 
-    const { username, password } = req.body || {};
     const check = security.verifyAccountCredentials(username, password, authConfig);
 
     if (!check.valid) {
-      loginLimiter.recordFailure(ip);
-      await new Promise((r) => setTimeout(r, 350));
+      ipFloodLimiter.recordFailure(ip);
+      accountLimiter.recordFailure(normUserKey);
+      await new Promise((r) => setTimeout(r, 250));
       return res.status(401).json({
         ok: false,
         error: 'Usuario o contraseña incorrectos.'
       });
     }
 
-    loginLimiter.reset(ip);
+    accountLimiter.reset(normUserKey);
     const sessionData = security.createSessionToken({
       role: check.role,
       accountId: check.accountId,

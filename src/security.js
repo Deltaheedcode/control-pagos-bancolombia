@@ -9,61 +9,94 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const VAULT_KEY_PATH = path.join(DATA_DIR, '.vault.key');
 const SESSION_COOKIE_NAME = 'bcol_strict_session_v2';
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 horas máximo en memoria activa
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
-// Parámetros criptográficos de alto costo contra fuerza bruta (scrypt)
-const SCRYPT_PARAMS = {
-  N: 32768,
+const USER_SCRYPT_PARAMS = {
+  N: 1024,
+  r: 8,
+  p: 1
+};
+
+const PASS_SCRYPT_PARAMS = {
+  N: 16384,
   r: 8,
   p: 1,
-  maxmem: 64 * 1024 * 1024
+  maxmem: 32 * 1024 * 1024
 };
+
+// Semilla criptográfica fija para no invalidar bóvedas AES-256-GCM ya guardadas en Render
+const RENDER_VAULT_SEED =
+  '44fe1a6e096c83a196e1eb55b43450b49c182ae8b1607ef4eff055d230d71a19d03ece66047e0bb1ea01ed8b91de1b4dff1513642bd6936783460cfa48c9ff5a:' +
+  '5bed2e925a74f316407d36825ba3c6d35e39769558ab71af0b41704dedaf0439b85ea5dfcd3e86aa7a047dfb0f017bc559879918043fab28f1e6d0a89957f2f2:' +
+  'render-stable-v1';
+
+/**
+ * Normaliza el nombre de usuario (ignora mayúsculas/minúsculas y espacios accidentales en móvil,
+ * por ejemplo "celular 1", "Celular 1", "celular1" y "CELULAR1" se normalizan igual antes de derivar su hash).
+ */
+function normalizeUsernameInput(username) {
+  return String(username || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
 
 /**
  * CUENTAS VERIFICABLES DEL SISTEMA (SOLO MODIFICABLES POR CÓDIGO)
- * Ningún usuario ni contraseña existe en texto plano en ningún archivo.
- * Todos están almacenados únicamente como derivaciones irreversibles scrypt de 512 bits con sal de 256 bits.
- *
- * Roles:
- *  - 'admin': Control total (configuración, simulador, borrado, QR, PDF, pagos)
- *  - 'viewer': Solo lectura para celulares (ver pagos en tiempo real y lectura de voz)
- *
- * Para generar nuevas credenciales por consola sin exponer claves en el código:
- *   node src/security.js generar-credenciales "viewer" "Celular 1" "NUEVO_USUARIO" "NuevaClave"
+ * Cero usuarios o claves en texto plano.
  */
 const DEFAULT_ACCOUNTS = Object.freeze([
   Object.freeze({
     id: 'admin',
     role: 'admin',
     label: 'Administrador',
-    uSalt: '004a05513d6dc10aadca7bcd007d2a94b7fa4fa7eb678f3871e41daa26b0585c',
-    uHash: '5bed2e925a74f316407d36825ba3c6d35e39769558ab71af0b41704dedaf0439b85ea5dfcd3e86aa7a047dfb0f017bc559879918043fab28f1e6d0a89957f2f2',
-    pSalt: '32bdb93a154cd10e3c5eb04c922168b52d6f295692ae95524f5a024afc7b98d8',
-    pHash: '44fe1a6e096c83a196e1eb55b43450b49c182ae8b1607ef4eff055d230d71a19d03ece66047e0bb1ea01ed8b91de1b4dff1513642bd6936783460cfa48c9ff5a'
+    uSalt: 'a7e9934823928e0a27094b12b80ee27ab147fd2b23f8b682bc10b5dc46b07b93',
+    uHash: 'd3f85c7813bc353d700b4f54f3f03fb397ba31361dfcc371686a2b14f277a0a1d3e7880a266555db9aab4bdb31c768ff8246e52a2685bbe60b9555165b887b73',
+    pVariants: Object.freeze([
+      Object.freeze({
+        pSalt: '07ef9b3f9e8a978525c6ed1251f449c5b8b18cd3b87cfad8b3287094cbe02375',
+        pHash: 'b10748cceceafdb616cfcec9110692369a9c09491a7aecfb6f1038aff92bb242d1a58b76fb62a61dfa6bc32f5c7c028ec615d6dcab13e0daf4416fc9abdd30e7'
+      })
+    ])
   }),
   Object.freeze({
     id: 'phone_1',
     role: 'viewer',
     label: 'Celular 1',
-    uSalt: '21569d32e55939a74cf52ce9c95cddf0d3378b2bf52f8f4d3824a5780733ac27',
-    uHash: '52d5829bda658608dec7195f65755e99c9e63bab8fe115e7578718657c9cdaf6db89c2e75162f5581d307ef6acd992b45191a77ab2f33783fd63903f4599cf14',
-    pSalt: '6bdecda1dd1b3303fc98d33f31bd603ea35a6e4fc5b70c3b4d02aea2705ccd12',
-    pHash: '89fde2ff2f50dc1ec28f676882acd56c25334cf94a985fbfe62ead2ca5cc5dfd8e329061c7ce0f7b7e2ba378048e5a8611ca3697db7d01d80f7bd38de125b00b'
+    uSalt: 'b73a2dee042060a913556c7fcd8140ac26161994bf80c5eaef196d33322720eb',
+    uHash: '1aca4317af5d7c67ca8fce815d7f7bb47be9ddd0885bcec3859dfffc5797a8498430fdded2beaf2e2b40b33115ffc43487498e8e2f198768f8790a0ba8ed6002',
+    pVariants: Object.freeze([
+      Object.freeze({
+        pSalt: '0c934ddee2c1a06e961b28a45e086e4afc3da14bc86d5af6d1f0c4597b077351',
+        pHash: '444cf0af1ec3b8351c34b39f8386d69dac5b809b2f409b0598494ca80ed95ea9cd0e93b9c3c4ad98f6e7e7e30648da5eb9d1445503d6eead0d658350cf952df1'
+      }),
+      Object.freeze({
+        pSalt: '9a85dbfbb6cf4320acb42741b8b5627a38cebe8660318624d310ec824fb29d8a',
+        pHash: 'd4ce98ed743f1938000ee67b55c1887b480e0d6fdbb18e11e291ef1b57ec2f4dfc559e9bace326ba0ac0c4d116b9cd52de4bb3bc5940b68510a4499555ce549f'
+      })
+    ])
   }),
   Object.freeze({
     id: 'phone_2',
     role: 'viewer',
     label: 'Celular 2',
-    uSalt: '87871faa1302f2289b44e4efbb570bbe08ee624201640148af9cf8e64bc59420',
-    uHash: '7357e998bce854800744237b9a34173f55727d638b449094d2ebb298c5174d5a9757f7fc5185a61ae13df60aae45780bb0de4e18a0cec22f63ff3209be8690a1',
-    pSalt: 'd790ef998ff8988c559f7d70759da15b387340865af05b251a98fa959639586c',
-    pHash: '69f14d55da16a304f43200682018a46249956cadf044f88c3ccb1551182dc581224d0ca472ff325698fc561d855a2a73a553bfbab2c0d8ee01999f99e7fdd89a'
+    uSalt: 'e03b934cc410ba84c5d7014580104bf7b14c416edd8f25f0f5e16f7ebf4c1bf8',
+    uHash: 'c2e286ae347a9dbecef0b65f2b01bbeb6342223089ed8951c90ae700ec4be5ee12a62e94c32f812dad6d76af87bce127aa16b97f923b6463c9335ea890f22c77',
+    pVariants: Object.freeze([
+      Object.freeze({
+        pSalt: 'b75513f99a836e5bab68b94d488173ede6642fc596d205fb98beb829992d49b2',
+        pHash: '413843b5200164b467651ffd729d0cc21fdcb5feb2e9c3724bc9e746ee47db5f80ab2ad0a4596b4c568d6a25d34cbfc9307069127e5de3272e03489d3f612466'
+      }),
+      Object.freeze({
+        pSalt: '219341c3b039b1eb838f83015048230380bbd10efcd50c39a0937384217a907c',
+        pHash: '5832e8d38384543ac14b9915b27b7e3628669b0b81e9365f9ec4b2ff1a140c882b385b7953676a9b32cacac1927d2f3ea39f78da90c8fe035062b97f61357d10'
+      })
+    ])
   })
 ]);
 
 const DEFAULT_ADMIN_AUTH = DEFAULT_ACCOUNTS[0];
 
-// Fragmentos ofuscados por XOR en memoria para reforzar la derivación de bóveda AES-256-GCM
 const SHARD_A = [
   0x9a, 0x41, 0xd7, 0x2c, 0x88, 0xf3, 0x19, 0x6e,
   0x54, 0xb2, 0x0d, 0x77, 0xe1, 0x3a, 0xc9, 0x62,
@@ -90,12 +123,8 @@ function getOrCreateRuntimeMasterSecret() {
     return Buffer.from(process.env.APP_SECRET_KEY.trim(), 'utf8');
   }
 
-  // En Render se mantiene exactamente la misma derivación estable para no invalidar bóvedas previas
   if (process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
-    return crypto
-      .createHash('sha256')
-      .update(DEFAULT_ADMIN_AUTH.pHash + ':' + DEFAULT_ADMIN_AUTH.uHash + ':render-stable-v1')
-      .digest();
+    return crypto.createHash('sha256').update(RENDER_VAULT_SEED).digest();
   }
 
   try {
@@ -136,66 +165,90 @@ function getSessionSigningKey() {
 }
 
 function generateCredentialsConfig(username, password, role = 'admin', label = 'Usuario') {
+  const normUser = normalizeUsernameInput(username);
+  const cleanPass = String(password || '').trim();
   const uSalt = crypto.randomBytes(32);
   const pSalt = crypto.randomBytes(32);
-  const uHash = crypto.scryptSync(String(username).trim(), uSalt, 64, SCRYPT_PARAMS);
-  const pHash = crypto.scryptSync(String(password), pSalt, 64, SCRYPT_PARAMS);
+  const uHash = crypto.scryptSync(normUser, uSalt, 64, USER_SCRYPT_PARAMS);
+  const pHash = crypto.scryptSync(cleanPass, pSalt, 64, PASS_SCRYPT_PARAMS);
   return {
     id: `${role}_${crypto.randomBytes(3).toString('hex')}`,
     role: role === 'viewer' ? 'viewer' : 'admin',
     label: String(label || (role === 'viewer' ? 'Celular' : 'Administrador')),
     uSalt: uSalt.toString('hex'),
     uHash: uHash.toString('hex'),
-    pSalt: pSalt.toString('hex'),
-    pHash: pHash.toString('hex')
+    pVariants: [
+      {
+        pSalt: pSalt.toString('hex'),
+        pHash: pHash.toString('hex')
+      }
+    ]
   };
 }
 
 function verifyAccountCredentials(username, password, accountsOrSingle = DEFAULT_ACCOUNTS) {
-  const cleanUser = String(username || '').trim();
-  const rawPass = String(password || '');
+  const normUser = normalizeUsernameInput(username);
+  // Quitar espacios exteriores accidentales al pegar claves desde el portapapeles del celular
+  const cleanPass = String(password || '').trim();
+
   const list = Array.isArray(accountsOrSingle)
     ? accountsOrSingle
     : [{ ...accountsOrSingle, id: 'admin', role: 'admin', label: 'Administrador' }];
 
-  let matchedAccount = null;
-
-  // Evaluar todas las cuentas sin retorno temprano para mantener tiempo constante
+  // Paso 1: localizar cuenta por hash de usuario normalizado
+  let targetAccount = null;
   for (const acc of list) {
     const uSalt = Buffer.from(acc.uSalt, 'hex');
     const expectedUHash = Buffer.from(acc.uHash, 'hex');
-    const pSalt = Buffer.from(acc.pSalt, 'hex');
-    const expectedPHash = Buffer.from(acc.pHash, 'hex');
-
-    const actualUHash = crypto.scryptSync(cleanUser, uSalt, 64, SCRYPT_PARAMS);
-    const actualPHash = crypto.scryptSync(rawPass, pSalt, 64, SCRYPT_PARAMS);
+    const actualUHash = crypto.scryptSync(normUser, uSalt, 64, USER_SCRYPT_PARAMS);
 
     const userOk =
       actualUHash.length === expectedUHash.length &&
       crypto.timingSafeEqual(actualUHash, expectedUHash);
-    const passOk =
-      actualPHash.length === expectedPHash.length &&
-      crypto.timingSafeEqual(actualPHash, expectedPHash);
-
     actualUHash.fill(0);
-    actualPHash.fill(0);
 
-    if (userOk && passOk && !matchedAccount) {
-      matchedAccount = {
-        accountId: acc.id || 'user',
-        role: acc.role === 'viewer' ? 'viewer' : 'admin',
-        label: acc.label || (acc.role === 'viewer' ? 'Celular' : 'Administrador')
-      };
+    if (userOk && !targetAccount) {
+      targetAccount = acc;
     }
   }
 
-  if (!matchedAccount) {
+  // Si el usuario no coincide con ninguno, ejecutar un cálculo scrypt simulado para evitar ataques de tiempo
+  if (!targetAccount) {
+    const dummySalt = Buffer.from(list[0].uSalt, 'hex');
+    const dummy = crypto.scryptSync(cleanPass, dummySalt, 64, PASS_SCRYPT_PARAMS);
+    dummy.fill(0);
+    return { valid: false };
+  }
+
+  // Paso 2: verificar contraseña contra las variantes autorizadas de esa cuenta
+  const variants = Array.isArray(targetAccount.pVariants)
+    ? targetAccount.pVariants
+    : [{ pSalt: targetAccount.pSalt, pHash: targetAccount.pHash }];
+
+  let passMatched = false;
+  for (const v of variants) {
+    const pSalt = Buffer.from(v.pSalt, 'hex');
+    const expectedPHash = Buffer.from(v.pHash, 'hex');
+    const actualPHash = crypto.scryptSync(cleanPass, pSalt, 64, PASS_SCRYPT_PARAMS);
+
+    if (
+      actualPHash.length === expectedPHash.length &&
+      crypto.timingSafeEqual(actualPHash, expectedPHash)
+    ) {
+      passMatched = true;
+    }
+    actualPHash.fill(0);
+  }
+
+  if (!passMatched) {
     return { valid: false };
   }
 
   return {
     valid: true,
-    ...matchedAccount
+    accountId: targetAccount.id || 'user',
+    role: targetAccount.role === 'viewer' ? 'viewer' : 'admin',
+    label: targetAccount.label || (targetAccount.role === 'viewer' ? 'Celular' : 'Administrador')
   };
 }
 
@@ -264,8 +317,7 @@ function decryptSecret(storedValue) {
   }
 }
 
-// --- SESIONES ESTRICTAS DE INSTANCIA ÚNICA POR CUENTA (1 USUARIO = 1 NAVEGADOR ACTIVO) ---
-// Mapa en servidor: accountId -> jti activo actual. Cualquier token anterior queda invalidado al instante.
+// --- SESIONES ESTRICTAS DE INSTANCIA ÚNICA POR CUENTA ---
 const activeSessionByAccount = new Map();
 const revokedJtis = new Map();
 
@@ -282,7 +334,6 @@ function createSessionToken(accountInfo = {}, ttlMs = SESSION_TTL_MS) {
   const accountId = String(accountInfo.accountId || role);
   const jti = crypto.randomBytes(16).toString('hex');
 
-  // Revocar inmediatamente cualquier sesión previa de esta misma cuenta en otro navegador/dispositivo
   const previousJti = activeSessionByAccount.get(accountId);
   if (previousJti && previousJti !== jti) {
     cleanupRevoked();
@@ -355,7 +406,6 @@ function inspectSessionToken(token) {
     if (payload.jti && revokedJtis.has(payload.jti)) {
       return { valid: false, reason: 'replaced' };
     }
-    // Exigir que el jti coincida exactamente con la única sesión activa registrada en el servidor para esa cuenta
     const currentActiveJti = activeSessionByAccount.get(payload.accountId);
     if (!currentActiveJti || currentActiveJti !== payload.jti) {
       return { valid: false, reason: 'replaced' };
@@ -401,14 +451,14 @@ function parseCookies(cookieHeader) {
 }
 
 class LoginRateLimiter {
-  constructor({ maxAttempts = 5, windowMs = 15 * 60 * 1000 } = {}) {
+  constructor({ maxAttempts = 8, windowMs = 10 * 60 * 1000 } = {}) {
     this.maxAttempts = maxAttempts;
     this.windowMs = windowMs;
     this.attempts = new Map();
   }
 
-  check(ip) {
-    const key = String(ip || 'unknown');
+  check(keyStr) {
+    const key = String(keyStr || 'unknown');
     const now = Date.now();
     const entry = this.attempts.get(key);
     if (!entry) return { blocked: false, remaining: this.maxAttempts };
@@ -428,8 +478,8 @@ class LoginRateLimiter {
     return { blocked: false, remaining: this.maxAttempts - entry.count };
   }
 
-  recordFailure(ip) {
-    const key = String(ip || 'unknown');
+  recordFailure(keyStr) {
+    const key = String(keyStr || 'unknown');
     const now = Date.now();
     const entry = this.attempts.get(key);
     if (!entry || now > entry.resetAt) {
@@ -439,15 +489,14 @@ class LoginRateLimiter {
     }
   }
 
-  reset(ip) {
-    this.attempts.delete(String(ip || 'unknown'));
+  reset(keyStr) {
+    this.attempts.delete(String(keyStr || 'unknown'));
   }
 }
 
 if (require.main === module) {
   const cmd = process.argv[2];
   if (cmd === 'generar-credenciales') {
-    // Soporta tanto 2 args ("USUARIO" "CLAVE") como 4 args ("viewer" "Celular 1" "USUARIO" "CLAVE")
     if (process.argv.length >= 7) {
       const [, , , role, label, newUser, newPass] = process.argv;
       const generated = generateCredentialsConfig(newUser, newPass, role, label);
@@ -472,6 +521,7 @@ module.exports = {
   SESSION_TTL_MS,
   DEFAULT_ACCOUNTS,
   DEFAULT_ADMIN_AUTH,
+  normalizeUsernameInput,
   generateCredentialsConfig,
   verifyAccountCredentials,
   verifyAdminCredentials,

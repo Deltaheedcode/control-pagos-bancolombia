@@ -138,15 +138,15 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
     });
     assert.equal(unauthWsCode, 4001);
 
-    // 3. Bloqueo anti-fuerza bruta tras 5 intentos fallidos desde una IP atacante
-    for (let i = 0; i < 5; i += 1) {
+    // 3. Bloqueo anti-fuerza bruta tras 8 intentos fallidos hacia una cuenta
+    for (let i = 0; i < 8; i += 1) {
       const badResp = await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Forwarded-For': '198.51.100.77'
         },
-        body: JSON.stringify({ username: 'INTRUSO', password: 'wrong' })
+        body: JSON.stringify({ username: 'ADMIN_TEST', password: 'wrong' })
       });
       assert.equal(badResp.status, 401);
     }
@@ -159,6 +159,17 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
       body: JSON.stringify({ username: 'ADMIN_TEST', password: 'ClaveEfimeraAdmin#99' })
     });
     assert.equal(lockedResp.status, 429);
+
+    // Verificar que otro usuario en el mismo Wi-Fi (198.51.100.77) NO quede bloqueado
+    const celSameWifiOk = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.77'
+      },
+      body: JSON.stringify({ username: 'cel1 _ test', password: '  ClaveEfimeraCel1#99  ' })
+    });
+    assert.equal(celSameWifiOk.status, 200);
 
     // 4. Inicio de sesión legítimo de Admin y prueba de SESIÓN ÚNICA (abrir en otro navegador cierra la anterior)
     const loginBrowser1 = await fetch(`${baseUrl}/api/auth/login`, {
