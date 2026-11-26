@@ -148,9 +148,53 @@ function buildSessionCookieHeader(token, maxAgeSeconds, secureFlag) {
   return parts.join('; ');
 }
 
+// Ocultar información sensible (correos, servidores, remitentes internos) a usuarios viewer (celulares)
+function sanitizeSettingsForRole(settings, role) {
+  if (role === 'admin') return settings;
+  return {
+    business_name: settings.business_name || 'Control de Pagos Bancolombia',
+    voice_enabled_default: settings.voice_enabled_default || 'true',
+    has_password: Boolean(settings.has_password)
+  };
+}
+
+function sanitizeWatcherStatusForRole(status, role) {
+  if (!status || role === 'admin') return status;
+  const safeMsg =
+    status.state === 'connected'
+      ? 'Monitoreo Turbo activo en tiempo real (1.5 s)'
+      : status.state === 'connecting'
+        ? 'Conectando al servidor de notificaciones...'
+        : 'En espera de activación por el Administrador';
+
+  return {
+    state: status.state,
+    message: safeMsg,
+    lastCheckAt: status.lastCheckAt,
+    hasPassword: Boolean(status.hasPassword),
+    officialSenders: ['Entidad Oficial Autorizada']
+  };
+}
+
+function sanitizePaymentForRole(payment, role) {
+  if (!payment || role === 'admin') return payment;
+  return {
+    id: payment.id,
+    amount: payment.amount,
+    formatted_amount: payment.formatted_amount,
+    voice_phrase: payment.voice_phrase,
+    channel: payment.channel,
+    payer: payment.payer,
+    reference: payment.reference,
+    sender_email: 'Correo Oficial Verificado',
+    is_test: payment.is_test,
+    received_at: payment.received_at
+  };
+}
+
 function createAppServer({
   autoStartWatcher = true,
-  authConfig = security.DEFAULT_ADMIN_AUTH
+  authConfig = security.DEFAULT_ACCOUNTS
 } = {}) {
   const app = express();
   const loginLimiter = new security.LoginRateLimiter({
@@ -158,7 +202,6 @@ function createAppServer({
     windowMs: 15 * 60 * 1000
   });
 
-  // Cabeceras de seguridad endurecidas
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -170,7 +213,7 @@ function createAppServer({
     next();
   });
 
-  app.use(express.json({ limit: '256kb' }));
+  app.use(express.json({ limit: '512kb' }));
   app.use(express.static(path.join(__dirname, 'public')));
 
   const server = http.createServer(app);
@@ -186,7 +229,8 @@ function createAppServer({
     for (const [id, info] of connectedClients.entries()) {
       arr.push({
         id,
-        name: info.name,
+        name: info.accountLabel ? `${info.accountLabel} (${info.name})` : info.name,
+        role: info.role,
         deviceType: info.deviceType,
         voiceEnabled: info.voiceEnabled,
         connectedAt: info.connectedAt
@@ -195,13 +239,28 @@ function createAppServer({
     return arr;
   }
 
-  function broadcast(payload) {
-    const raw = JSON.stringify(payload);
-    for (const { ws } of connectedClients.values()) {
-      if (ws.readyState === 1) {
-        ws.send(raw);
+  function broadcastByRole(buildPayloadForRole) {
+    const adminRaw = JSON.stringify(buildPayloadForRole('admin'));
+    const viewerPayload = buildPayloadForRole('viewer');
+    const viewerRaw = viewerPayload ? JSON.stringify(viewerPayload) : null;
+
+    for (const entry of connectedClients.values()) {
+      if (entry.ws.readyState !== 1) continue;
+      if (entry.role === 'admin') {
+        entry.ws.send(adminRaw);
+      } else if (viewerRaw) {
+        entry.ws.send(viewerRaw);
       }
     }
+  }
+
+  function broadcastDevicesToAdmins() {
+    const list = getDevicesList();
+    broadcastByRole((role) =>
+      role === 'admin'
+        ? { type: 'devices', devices: list }
+        : { type: 'devices', devices: [] }
+    );
   }
 
   function getVerifiedSessionFromReq(req) {
@@ -222,21 +281,45 @@ function createAppServer({
         error: 'Acceso restringido. Debes iniciar sesión.'
       });
     }
-    req.adminSession = session;
+    req.userSession = session;
     return next();
   }
 
-  // Healthcheck para Render (no expone ningún dato privado)
+  function requireAdmin(req, res, next) {
+    const session = getVerifiedSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({
+        ok: false,
+        authRequired: true,
+        error: 'Acceso restringido. Debes iniciar sesión.'
+      });
+    }
+    if (session.payload.role !== 'admin') {
+      return res.status(403).json({
+        ok: false,
+        forbidden: true,
+        error: 'Permiso denegado: esta función es exclusiva del Administrador.'
+      });
+    }
+    req.userSession = session;
+    return next();
+  }
+
   app.get('/api/health', (req, res) => {
     res.json({ ok: true, status: 'healthy' });
   });
 
-  // --- ENDPOINTS DE AUTENTICACIÓN (SIN OPCIÓN DE CAMBIAR CLAVE POR INTERFAZ) ---
+  // --- AUTENTICACIÓN DE ROLES (ADMIN Y CELULARES SOLO LECTURA) ---
   app.get('/api/auth/session', (req, res) => {
     const session = getVerifiedSessionFromReq(req);
-    res.json({
+    if (!session) {
+      return res.json({ ok: true, authenticated: false });
+    }
+    return res.json({
       ok: true,
-      authenticated: Boolean(session)
+      authenticated: true,
+      role: session.payload.role,
+      label: session.payload.label
     });
   });
 
@@ -252,11 +335,10 @@ function createAppServer({
     }
 
     const { username, password } = req.body || {};
-    const valid = security.verifyAdminCredentials(username, password, authConfig);
+    const check = security.verifyAccountCredentials(username, password, authConfig);
 
-    if (!valid) {
+    if (!check.valid) {
       loginLimiter.recordFailure(ip);
-      // Pequeña pausa adicional contra fuerza bruta automatizada
       await new Promise((r) => setTimeout(r, 350));
       return res.status(401).json({
         ok: false,
@@ -265,7 +347,11 @@ function createAppServer({
     }
 
     loginLimiter.reset(ip);
-    const token = security.createSessionToken();
+    const token = security.createSessionToken({
+      role: check.role,
+      accountId: check.accountId,
+      label: check.label
+    });
     const maxAgeSec = Math.floor(security.SESSION_TTL_MS / 1000);
     res.setHeader(
       'Set-Cookie',
@@ -274,7 +360,9 @@ function createAppServer({
 
     return res.json({
       ok: true,
-      authenticated: true
+      authenticated: true,
+      role: check.role,
+      label: check.label
     });
   });
 
@@ -283,7 +371,6 @@ function createAppServer({
     const token = cookies[security.SESSION_COOKIE_NAME];
     if (token) {
       security.revokeSessionToken(token);
-      // Cerrar WebSockets asociados a ese token de sesión
       for (const [id, entry] of connectedClients.entries()) {
         if (entry.sessionToken === token) {
           try {
@@ -292,7 +379,7 @@ function createAppServer({
           connectedClients.delete(id);
         }
       }
-      broadcast({ type: 'devices', devices: getDevicesList() });
+      broadcastDevicesToAdmins();
     }
 
     res.setHeader(
@@ -302,47 +389,90 @@ function createAppServer({
     res.json({ ok: true, authenticated: false });
   });
 
-  // --- TODOS LOS ENDPOINTS SIGUIENTES EXIGEN SESIÓN VÁLIDA ---
+  // --- LECTURA PERMITIDA TANTO A ADMIN COMO A CELULARES (CON REDACCIÓN PARA VIEWER) ---
   app.get('/api/state', requireAuth, (req, res) => {
+    const role = req.userSession.payload.role;
+    const rawSettings = db.getAllSettings(false);
+    const rawWatcher = emailWatcher.getStatus();
+
     res.json({
       ok: true,
-      settings: db.getAllSettings(false),
+      role,
+      userLabel: req.userSession.payload.label,
+      settings: sanitizeSettingsForRole(rawSettings, role),
       encryptedVault: db.exportEncryptedVault(),
-      watcherStatus: emailWatcher.getStatus(),
-      devices: getDevicesList(),
-      officialPresets: parser.DEFAULT_BANCOLOMBIA_SENDERS,
-      auditEvents: db.listAuditEvents(15)
+      watcherStatus: sanitizeWatcherStatusForRole(rawWatcher, role),
+      devices: role === 'admin' ? getDevicesList() : [],
+      officialPresets: role === 'admin' ? parser.DEFAULT_BANCOLOMBIA_SENDERS : [],
+      auditEvents: role === 'admin' ? db.listAuditEvents(15) : []
     });
   });
 
+  // Restauración de bóveda sellada AES-256-GCM (firmada criptográficamente por el servidor, ilegible afuera)
   app.post('/api/settings/restore-vault', requireAuth, async (req, res) => {
+    const role = req.userSession.payload.role;
     const { encryptedVault } = req.body || {};
     const result = db.restoreEncryptedVault(encryptedVault);
 
-    if (result.restored && autoStartWatcher) {
+    if (result.restoredSettings && autoStartWatcher) {
       emailWatcher.restart().catch(() => {});
     }
 
     const freshVault = db.exportEncryptedVault();
     if (result.restored) {
-      broadcast({
+      const fullSettings = db.getAllSettings(false);
+      const fullStatus = emailWatcher.getStatus();
+      broadcastByRole((r) => ({
         type: 'settings_updated',
-        settings: result.settings,
+        settings: sanitizeSettingsForRole(fullSettings, r),
         encryptedVault: freshVault,
-        watcherStatus: emailWatcher.getStatus()
-      });
+        watcherStatus: sanitizeWatcherStatusForRole(fullStatus, r)
+      }));
+      if (result.restoredPaymentsCount > 0) {
+        broadcastByRole(() => ({ type: 'payments_changed' }));
+      }
     }
 
     res.json({
       ok: true,
       restored: result.restored,
-      settings: db.getAllSettings(false),
+      settings: sanitizeSettingsForRole(db.getAllSettings(false), role),
       encryptedVault: freshVault,
-      watcherStatus: emailWatcher.getStatus()
+      watcherStatus: sanitizeWatcherStatusForRole(emailWatcher.getStatus(), role)
     });
   });
 
-  app.get('/api/network-info', requireAuth, async (req, res) => {
+  app.get('/api/payments', requireAuth, (req, res) => {
+    const role = req.userSession.payload.role;
+    const range = resolvePeriodRange(req.query);
+    const data = db.listPayments({
+      startIso: range.startIso,
+      endIso: range.endIso,
+      limit: 1000
+    });
+    res.json({
+      ok: true,
+      ...range,
+      count: data.count,
+      total_amount: data.total_amount,
+      formatted_total: data.formatted_total,
+      payments: data.payments.map((p) => sanitizePaymentForRole(p, role))
+    });
+  });
+
+  app.post('/api/email/check-now', requireAuth, async (req, res) => {
+    const role = req.userSession.payload.role;
+    const result = await emailWatcher.checkNow({ manual: true });
+    res.json({
+      ok: true,
+      checked: result.checked,
+      added: result.added,
+      watcherStatus: sanitizeWatcherStatusForRole(emailWatcher.getStatus(), role)
+    });
+  });
+
+  // --- PODERES EXCLUSIVOS DE ROL ADMIN (BLOQUEADOS CON 403 PARA CELULARES) ---
+  app.get('/api/network-info', requireAdmin, async (req, res) => {
     const actualPort = (server.address() && server.address().port) || PORT;
     const reqHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
     const reqProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
@@ -413,21 +543,7 @@ function createAppServer({
     });
   });
 
-  app.get('/api/payments', requireAuth, (req, res) => {
-    const range = resolvePeriodRange(req.query);
-    const data = db.listPayments({
-      startIso: range.startIso,
-      endIso: range.endIso,
-      limit: 1000
-    });
-    res.json({
-      ok: true,
-      ...range,
-      ...data
-    });
-  });
-
-  app.get('/api/report/pdf', requireAuth, (req, res) => {
+  app.get('/api/report/pdf', requireAdmin, (req, res) => {
     const range = resolvePeriodRange(req.query);
     const data = db.listPayments({
       startIso: range.startIso,
@@ -451,7 +567,7 @@ function createAppServer({
     });
   });
 
-  app.post('/api/settings', requireAuth, async (req, res) => {
+  app.post('/api/settings', requireAdmin, async (req, res) => {
     const body = req.body || {};
     const prev = db.getAllSettings(true);
 
@@ -486,37 +602,29 @@ function createAppServer({
     }
 
     const freshVault = db.exportEncryptedVault();
+    const fullStatus = emailWatcher.getStatus();
 
-    broadcast({
+    broadcastByRole((r) => ({
       type: 'settings_updated',
-      settings: updated,
+      settings: sanitizeSettingsForRole(updated, r),
       encryptedVault: freshVault,
-      watcherStatus: emailWatcher.getStatus()
-    });
+      watcherStatus: sanitizeWatcherStatusForRole(fullStatus, r)
+    }));
 
     res.json({
       ok: true,
       settings: updated,
       encryptedVault: freshVault,
-      watcherStatus: emailWatcher.getStatus()
+      watcherStatus: fullStatus
     });
   });
 
-  app.post('/api/email/test-connection', requireAuth, async (req, res) => {
+  app.post('/api/email/test-connection', requireAdmin, async (req, res) => {
     const result = await emailWatcher.testConnection(req.body || {});
     res.json(result);
   });
 
-  app.post('/api/email/check-now', requireAuth, async (req, res) => {
-    const result = await emailWatcher.checkNow({ manual: true });
-    res.json({
-      ok: true,
-      ...result,
-      watcherStatus: emailWatcher.getStatus()
-    });
-  });
-
-  app.post('/api/payments/simulate', requireAuth, (req, res) => {
+  app.post('/api/payments/simulate', requireAdmin, (req, res) => {
     const body = req.body || {};
     const settings = db.getAllSettings(false);
     const officialList = parser.normalizeSenderList(settings.official_senders);
@@ -548,11 +656,14 @@ function createAppServer({
     }
 
     const { payment } = db.insertPayment(analysis.payment, true);
-    broadcast({
+    const freshVault = db.exportEncryptedVault();
+
+    broadcastByRole((r) => ({
       type: 'new_payment',
-      payment,
+      payment: sanitizePaymentForRole(payment, r),
+      encryptedVault: freshVault,
       announceVoice: true
-    });
+    }));
 
     return res.json({
       ok: true,
@@ -560,19 +671,21 @@ function createAppServer({
     });
   });
 
-  app.delete('/api/payments-test', requireAuth, (req, res) => {
+  app.delete('/api/payments-test', requireAdmin, (req, res) => {
     const deletedCount = db.clearTestPayments();
-    broadcast({ type: 'payments_changed' });
+    const freshVault = db.exportEncryptedVault();
+    broadcastByRole(() => ({ type: 'payments_changed', encryptedVault: freshVault }));
     res.json({ ok: true, deletedCount });
   });
 
-  app.delete('/api/payments/:id', requireAuth, (req, res) => {
+  app.delete('/api/payments/:id', requireAdmin, (req, res) => {
     const deleted = db.deletePayment(req.params.id);
-    broadcast({ type: 'payments_changed' });
+    const freshVault = db.exportEncryptedVault();
+    broadcastByRole(() => ({ type: 'payments_changed', encryptedVault: freshVault }));
     res.json({ ok: true, deleted });
   });
 
-  // WebSocket exige cookie de sesión HttpOnly válida
+  // WebSocket autenticado para Administrador y Celulares (viewer)
   wss.on('connection', (ws, req) => {
     const cookies = security.parseCookies(req.headers.cookie);
     const token = cookies[security.SESSION_COOKIE_NAME];
@@ -587,30 +700,31 @@ function createAppServer({
     const ua = String(req.headers['user-agent'] || '');
     const isMobile = /android|iphone|ipad|ipod|mobile/i.test(ua);
     const defaultName = /iphone|ipad/i.test(ua)
-      ? 'iPhone / iPad'
+      ? 'iPhone'
       : /android/i.test(ua)
-        ? 'Teléfono Android'
-        : 'Computador Principal';
+        ? 'Android'
+        : 'PC';
 
     const clientEntry = {
       ws,
       sessionToken: token,
+      role: verified.role,
+      accountLabel: verified.label,
       isAlive: true,
       name: defaultName,
-      deviceType: isMobile ? 'phone' : 'pc',
+      deviceType: isMobile || verified.role === 'viewer' ? 'phone' : 'pc',
       voiceEnabled: true,
       connectedAt: new Date().toISOString()
     };
 
     connectedClients.set(id, clientEntry);
-    broadcast({ type: 'devices', devices: getDevicesList() });
+    broadcastDevicesToAdmins();
 
     ws.on('pong', () => {
       clientEntry.isAlive = true;
     });
 
     ws.on('message', (raw) => {
-      // Re-verificar que el token no haya expirado ni sido revocado
       if (!security.verifySessionToken(clientEntry.sessionToken)) {
         ws.close(4001, 'Sesión expirada');
         return;
@@ -618,18 +732,17 @@ function createAppServer({
       try {
         const msg = JSON.parse(String(raw));
         if (msg.type === 'hello' || msg.type === 'update_device') {
-          if (msg.name) clientEntry.name = String(msg.name).slice(0, 40);
           if (typeof msg.voiceEnabled === 'boolean') {
             clientEntry.voiceEnabled = msg.voiceEnabled;
           }
-          broadcast({ type: 'devices', devices: getDevicesList() });
+          broadcastDevicesToAdmins();
         }
       } catch (_) {}
     });
 
     ws.on('close', () => {
       connectedClients.delete(id);
-      broadcast({ type: 'devices', devices: getDevicesList() });
+      broadcastDevicesToAdmins();
     });
   });
 
@@ -652,25 +765,24 @@ function createAppServer({
   });
 
   emailWatcher.on('payment', ({ payment, announceVoice }) => {
-    broadcast({
+    const freshVault = db.exportEncryptedVault();
+    broadcastByRole((r) => ({
       type: 'new_payment',
-      payment,
+      payment: sanitizePaymentForRole(payment, r),
+      encryptedVault: freshVault,
       announceVoice
-    });
+    }));
   });
 
   emailWatcher.on('status', (status) => {
-    broadcast({
+    broadcastByRole((r) => ({
       type: 'watcher_status',
-      status
-    });
+      status: sanitizeWatcherStatusForRole(status, r)
+    }));
   });
 
   emailWatcher.on('audit', (event) => {
-    broadcast({
-      type: 'audit_event',
-      event
-    });
+    broadcastByRole((r) => (r === 'admin' ? { type: 'audit_event', event } : null));
   });
 
   if (autoStartWatcher) {

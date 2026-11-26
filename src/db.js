@@ -143,23 +143,30 @@ function updateSettings(partial, customTimestamp = null) {
 
 function exportEncryptedVault() {
   const full = getAllSettings(true);
-  if (!full.email_pass) return null;
+  const recentRows = db
+    .prepare('SELECT * FROM payments ORDER BY received_at DESC, id DESC LIMIT 300')
+    .all();
+
+  if (!full.email_pass && recentRows.length === 0) return null;
 
   const payload = JSON.stringify({
     v: 1,
     updatedAt: Number(full.settings_updated_at) || Date.now(),
-    settings: {
-      business_name: full.business_name,
-      email_provider: full.email_provider,
-      email_user: full.email_user,
-      email_pass: full.email_pass,
-      imap_host: full.imap_host,
-      imap_port: full.imap_port,
-      imap_tls: full.imap_tls,
-      official_senders: full.official_senders,
-      sync_lookback: full.sync_lookback,
-      voice_enabled_default: full.voice_enabled_default
-    }
+    settings: full.email_pass
+      ? {
+          business_name: full.business_name,
+          email_provider: full.email_provider,
+          email_user: full.email_user,
+          email_pass: full.email_pass,
+          imap_host: full.imap_host,
+          imap_port: full.imap_port,
+          imap_tls: full.imap_tls,
+          official_senders: full.official_senders,
+          sync_lookback: full.sync_lookback,
+          voice_enabled_default: full.voice_enabled_default
+        }
+      : null,
+    payments: recentRows
   });
 
   return security.encryptSecret(payload);
@@ -177,21 +184,66 @@ function restoreEncryptedVault(vaultToken) {
 
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || parsed.v !== 1 || !parsed.settings || !parsed.settings.email_pass) {
+    if (!parsed || parsed.v !== 1) {
       return { restored: false, reason: 'invalid_payload' };
     }
+
+    let restoredSettings = false;
+    let restoredPaymentsCount = 0;
 
     const current = getAllSettings(true);
     const serverUpdatedAt = Number(current.settings_updated_at) || 0;
     const vaultUpdatedAt = Number(parsed.updatedAt) || Date.now();
+    const serverIsFreshBoot = !current.email_pass && serverUpdatedAt === 0;
 
-    // Restaurar si el servidor despertó sin contraseña o si la bóveda es más reciente
-    if (!current.email_pass || vaultUpdatedAt > serverUpdatedAt) {
-      const updated = updateSettings(parsed.settings, vaultUpdatedAt);
-      return { restored: true, settings: updated };
+    if (parsed.settings && parsed.settings.email_pass) {
+      if (!current.email_pass || vaultUpdatedAt > serverUpdatedAt) {
+        updateSettings(parsed.settings, vaultUpdatedAt);
+        restoredSettings = true;
+      }
     }
 
-    return { restored: false, reason: 'already_up_to_date', settings: getAllSettings(false) };
+    if (
+      Array.isArray(parsed.payments) &&
+      parsed.payments.length > 0 &&
+      (serverIsFreshBoot || vaultUpdatedAt >= serverUpdatedAt)
+    ) {
+      const insertOrIgnore = db.prepare(`
+        INSERT OR IGNORE INTO payments (
+          message_id, sender_email, sender_name, subject, amount,
+          channel, payer, reference, auth_status, auth_detail,
+          snippet, is_test, received_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const p of parsed.payments) {
+        if (!p || !p.message_id || !p.amount) continue;
+        const info = insertOrIgnore.run(
+          String(p.message_id),
+          String(p.sender_email || ''),
+          String(p.sender_name || ''),
+          String(p.subject || ''),
+          Number(p.amount),
+          String(p.channel || 'Transferencia Bancolombia'),
+          String(p.payer || ''),
+          String(p.reference || ''),
+          String(p.auth_status || 'unknown'),
+          String(p.auth_detail || ''),
+          String(p.snippet || ''),
+          p.is_test ? 1 : 0,
+          String(p.received_at || new Date().toISOString()),
+          String(p.created_at || new Date().toISOString())
+        );
+        if (info.changes > 0) restoredPaymentsCount += 1;
+      }
+    }
+
+    return {
+      restored: restoredSettings || restoredPaymentsCount > 0,
+      restoredSettings,
+      restoredPaymentsCount,
+      settings: getAllSettings(false)
+    };
   } catch (_) {
     return { restored: false, reason: 'corrupt_json' };
   }
@@ -289,11 +341,21 @@ function listPayments({ startIso, endIso, limit = 500 } = {}) {
 
 function deletePayment(id) {
   const info = db.prepare('DELETE FROM payments WHERE id = ?').run(Number(id));
+  if (info.changes > 0) {
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('settings_updated_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    ).run(String(Date.now()));
+  }
   return info.changes > 0;
 }
 
 function clearTestPayments() {
   const info = db.prepare('DELETE FROM payments WHERE is_test = 1').run();
+  if (info.changes > 0) {
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('settings_updated_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    ).run(String(Date.now()));
+  }
   return info.changes;
 }
 

@@ -9,7 +9,7 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const VAULT_KEY_PATH = path.join(DATA_DIR, '.vault.key');
 const SESSION_COOKIE_NAME = 'bcol_auth_session';
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días de sesión continua
 
 // Parámetros criptográficos de alto costo contra fuerza bruta (scrypt)
 const SCRYPT_PARAMS = {
@@ -20,19 +20,48 @@ const SCRYPT_PARAMS = {
 };
 
 /**
- * CREDENCIALES DEL SISTEMA (SOLO MODIFICABLES POR CÓDIGO)
- * Ni el usuario ni la contraseña existen en texto plano en ningún archivo.
- * Ambos están almacenados únicamente como derivaciones irreversibles scrypt de 512 bits con sal de 256 bits.
+ * CUENTAS VERIFICABLES DEL SISTEMA (SOLO MODIFICABLES POR CÓDIGO)
+ * Ningún usuario ni contraseña existe en texto plano en ningún archivo.
+ * Todos están almacenados únicamente como derivaciones irreversibles scrypt de 512 bits con sal de 256 bits.
  *
- * Para generar nuevas credenciales por consola sin exponer la clave en el código:
- *   node src/security.js generar-credenciales "NUEVO_USUARIO" "NuevaClaveSegura"
+ * Roles:
+ *  - 'admin': Control total (configuración, simulador, borrado, QR, PDF, pagos)
+ *  - 'viewer': Solo lectura para celulares (ver pagos en tiempo real y lectura de voz)
+ *
+ * Para generar nuevas credenciales por consola sin exponer claves en el código:
+ *   node src/security.js generar-credenciales "viewer" "Celular 1" "NUEVO_USUARIO" "NuevaClave"
  */
-const DEFAULT_ADMIN_AUTH = Object.freeze({
-  uSalt: '004a05513d6dc10aadca7bcd007d2a94b7fa4fa7eb678f3871e41daa26b0585c',
-  uHash: '5bed2e925a74f316407d36825ba3c6d35e39769558ab71af0b41704dedaf0439b85ea5dfcd3e86aa7a047dfb0f017bc559879918043fab28f1e6d0a89957f2f2',
-  pSalt: '32bdb93a154cd10e3c5eb04c922168b52d6f295692ae95524f5a024afc7b98d8',
-  pHash: '44fe1a6e096c83a196e1eb55b43450b49c182ae8b1607ef4eff055d230d71a19d03ece66047e0bb1ea01ed8b91de1b4dff1513642bd6936783460cfa48c9ff5a'
-});
+const DEFAULT_ACCOUNTS = Object.freeze([
+  Object.freeze({
+    id: 'admin',
+    role: 'admin',
+    label: 'Administrador',
+    uSalt: '004a05513d6dc10aadca7bcd007d2a94b7fa4fa7eb678f3871e41daa26b0585c',
+    uHash: '5bed2e925a74f316407d36825ba3c6d35e39769558ab71af0b41704dedaf0439b85ea5dfcd3e86aa7a047dfb0f017bc559879918043fab28f1e6d0a89957f2f2',
+    pSalt: '32bdb93a154cd10e3c5eb04c922168b52d6f295692ae95524f5a024afc7b98d8',
+    pHash: '44fe1a6e096c83a196e1eb55b43450b49c182ae8b1607ef4eff055d230d71a19d03ece66047e0bb1ea01ed8b91de1b4dff1513642bd6936783460cfa48c9ff5a'
+  }),
+  Object.freeze({
+    id: 'phone_1',
+    role: 'viewer',
+    label: 'Celular 1',
+    uSalt: '21569d32e55939a74cf52ce9c95cddf0d3378b2bf52f8f4d3824a5780733ac27',
+    uHash: '52d5829bda658608dec7195f65755e99c9e63bab8fe115e7578718657c9cdaf6db89c2e75162f5581d307ef6acd992b45191a77ab2f33783fd63903f4599cf14',
+    pSalt: '6bdecda1dd1b3303fc98d33f31bd603ea35a6e4fc5b70c3b4d02aea2705ccd12',
+    pHash: '89fde2ff2f50dc1ec28f676882acd56c25334cf94a985fbfe62ead2ca5cc5dfd8e329061c7ce0f7b7e2ba378048e5a8611ca3697db7d01d80f7bd38de125b00b'
+  }),
+  Object.freeze({
+    id: 'phone_2',
+    role: 'viewer',
+    label: 'Celular 2',
+    uSalt: '87871faa1302f2289b44e4efbb570bbe08ee624201640148af9cf8e64bc59420',
+    uHash: '7357e998bce854800744237b9a34173f55727d638b449094d2ebb298c5174d5a9757f7fc5185a61ae13df60aae45780bb0de4e18a0cec22f63ff3209be8690a1',
+    pSalt: 'd790ef998ff8988c559f7d70759da15b387340865af05b251a98fa959639586c',
+    pHash: '69f14d55da16a304f43200682018a46249956cadf044f88c3ccb1551182dc581224d0ca472ff325698fc561d855a2a73a553bfbab2c0d8ee01999f99e7fdd89a'
+  })
+]);
+
+const DEFAULT_ADMIN_AUTH = DEFAULT_ACCOUNTS[0];
 
 // Fragmentos ofuscados por XOR en memoria para reforzar la derivación de bóveda AES-256-GCM
 const SHARD_A = [
@@ -61,8 +90,7 @@ function getOrCreateRuntimeMasterSecret() {
     return Buffer.from(process.env.APP_SECRET_KEY.trim(), 'utf8');
   }
 
-  // En entornos efímeros de nube (Render) sin APP_SECRET_KEY explícita, derivar llave estable
-  // para que las sesiones y bóvedas cifradas sobrevivan cuando el contenedor entra en reposo
+  // En Render se mantiene exactamente la misma derivación estable para no invalidar bóvedas previas
   if (process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
     return crypto
       .createHash('sha256')
@@ -107,12 +135,15 @@ function getSessionSigningKey() {
   return cachedSessionKey;
 }
 
-function generateCredentialsConfig(username, password) {
+function generateCredentialsConfig(username, password, role = 'admin', label = 'Usuario') {
   const uSalt = crypto.randomBytes(32);
   const pSalt = crypto.randomBytes(32);
   const uHash = crypto.scryptSync(String(username).trim(), uSalt, 64, SCRYPT_PARAMS);
   const pHash = crypto.scryptSync(String(password), pSalt, 64, SCRYPT_PARAMS);
   return {
+    id: `${role}_${crypto.randomBytes(3).toString('hex')}`,
+    role: role === 'viewer' ? 'viewer' : 'admin',
+    label: String(label || (role === 'viewer' ? 'Celular' : 'Administrador')),
     uSalt: uSalt.toString('hex'),
     uHash: uHash.toString('hex'),
     pSalt: pSalt.toString('hex'),
@@ -120,33 +151,60 @@ function generateCredentialsConfig(username, password) {
   };
 }
 
-function verifyAdminCredentials(username, password, authConfig = DEFAULT_ADMIN_AUTH) {
+function verifyAccountCredentials(username, password, accountsOrSingle = DEFAULT_ACCOUNTS) {
   const cleanUser = String(username || '').trim();
   const rawPass = String(password || '');
+  const list = Array.isArray(accountsOrSingle)
+    ? accountsOrSingle
+    : [{ ...accountsOrSingle, id: 'admin', role: 'admin', label: 'Administrador' }];
 
-  const uSalt = Buffer.from(authConfig.uSalt, 'hex');
-  const expectedUHash = Buffer.from(authConfig.uHash, 'hex');
-  const pSalt = Buffer.from(authConfig.pSalt, 'hex');
-  const expectedPHash = Buffer.from(authConfig.pHash, 'hex');
+  let matchedAccount = null;
 
-  // Ejecutar siempre ambos cálculos scrypt para impedir ataques de tiempo (timing attacks)
-  const actualUHash = crypto.scryptSync(cleanUser, uSalt, 64, SCRYPT_PARAMS);
-  const actualPHash = crypto.scryptSync(rawPass, pSalt, 64, SCRYPT_PARAMS);
+  // Evaluar todas las cuentas sin retorno temprano para mantener tiempo constante
+  for (const acc of list) {
+    const uSalt = Buffer.from(acc.uSalt, 'hex');
+    const expectedUHash = Buffer.from(acc.uHash, 'hex');
+    const pSalt = Buffer.from(acc.pSalt, 'hex');
+    const expectedPHash = Buffer.from(acc.pHash, 'hex');
 
-  const userOk =
-    actualUHash.length === expectedUHash.length &&
-    crypto.timingSafeEqual(actualUHash, expectedUHash);
-  const passOk =
-    actualPHash.length === expectedPHash.length &&
-    crypto.timingSafeEqual(actualPHash, expectedPHash);
+    const actualUHash = crypto.scryptSync(cleanUser, uSalt, 64, SCRYPT_PARAMS);
+    const actualPHash = crypto.scryptSync(rawPass, pSalt, 64, SCRYPT_PARAMS);
 
-  actualUHash.fill(0);
-  actualPHash.fill(0);
+    const userOk =
+      actualUHash.length === expectedUHash.length &&
+      crypto.timingSafeEqual(actualUHash, expectedUHash);
+    const passOk =
+      actualPHash.length === expectedPHash.length &&
+      crypto.timingSafeEqual(actualPHash, expectedPHash);
 
-  return userOk && passOk;
+    actualUHash.fill(0);
+    actualPHash.fill(0);
+
+    if (userOk && passOk && !matchedAccount) {
+      matchedAccount = {
+        accountId: acc.id || 'user',
+        role: acc.role === 'viewer' ? 'viewer' : 'admin',
+        label: acc.label || (acc.role === 'viewer' ? 'Celular' : 'Administrador')
+      };
+    }
+  }
+
+  if (!matchedAccount) {
+    return { valid: false };
+  }
+
+  return {
+    valid: true,
+    ...matchedAccount
+  };
 }
 
-// --- CIFRADO AUTENTICADO AES-256-GCM PARA LA CLAVE DE APLICACIÓN ---
+function verifyAdminCredentials(username, password, authConfig = DEFAULT_ACCOUNTS) {
+  const res = verifyAccountCredentials(username, password, authConfig);
+  return res.valid && res.role === 'admin';
+}
+
+// --- CIFRADO AUTENTICADO AES-256-GCM ---
 const ENC_PREFIX = 'enc:gcm:v1:';
 
 function isEncryptedSecret(value) {
@@ -206,7 +264,7 @@ function decryptSecret(storedValue) {
   }
 }
 
-// --- GESTIÓN DE SESIONES FIRMADAS (HMAC-SHA256) Y REVOCACIÓN ---
+// --- SESIONES FIRMADAS HMAC-SHA256 CON ROL ---
 const revokedJtis = new Map();
 
 function cleanupRevoked() {
@@ -216,10 +274,13 @@ function cleanupRevoked() {
   }
 }
 
-function createSessionToken(ttlMs = SESSION_TTL_MS) {
+function createSessionToken(accountInfo = {}, ttlMs = SESSION_TTL_MS) {
   const now = Date.now();
+  const role = accountInfo.role === 'viewer' ? 'viewer' : 'admin';
   const payload = {
-    role: 'admin',
+    role,
+    accountId: accountInfo.accountId || role,
+    label: accountInfo.label || (role === 'viewer' ? 'Celular' : 'Administrador'),
     jti: crypto.randomBytes(16).toString('hex'),
     iat: now,
     exp: now + ttlMs
@@ -262,7 +323,12 @@ function verifySessionToken(token) {
 
   try {
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    if (!payload || payload.role !== 'admin' || !payload.exp || Date.now() > payload.exp) {
+    if (
+      !payload ||
+      (payload.role !== 'admin' && payload.role !== 'viewer') ||
+      !payload.exp ||
+      Date.now() > payload.exp
+    ) {
       return null;
     }
     if (payload.jti && revokedJtis.has(payload.jti)) {
@@ -302,7 +368,6 @@ function parseCookies(cookieHeader) {
   return out;
 }
 
-// --- PROTECCIÓN CONTRA FUERZA BRUTA POR IP ---
 class LoginRateLimiter {
   constructor({ maxAttempts = 5, windowMs = 15 * 60 * 1000 } = {}) {
     this.maxAttempts = maxAttempts;
@@ -347,39 +412,36 @@ class LoginRateLimiter {
   }
 }
 
-// Utilidad de línea de comandos para cambiar usuario/clave por código sin dejar texto plano
 if (require.main === module) {
   const cmd = process.argv[2];
   if (cmd === 'generar-credenciales') {
-    const newUser = process.argv[3];
-    const newPass = process.argv[4];
-    if (!newUser || !newPass) {
-      console.error('Uso: node src/security.js generar-credenciales "NUEVO_USUARIO" "NuevaClave"');
-      process.exit(1);
+    // Soporta tanto 2 args ("USUARIO" "CLAVE") como 4 args ("viewer" "Celular 1" "USUARIO" "CLAVE")
+    if (process.argv.length >= 7) {
+      const [, , , role, label, newUser, newPass] = process.argv;
+      const generated = generateCredentialsConfig(newUser, newPass, role, label);
+      console.log('\nAgrega o reemplaza este bloque en DEFAULT_ACCOUNTS de src/security.js:\n');
+      console.log('Object.freeze(' + JSON.stringify(generated, null, 2) + ')\n');
+      process.exit(0);
+    } else if (process.argv.length >= 5) {
+      const newUser = process.argv[3];
+      const newPass = process.argv[4];
+      const generated = generateCredentialsConfig(newUser, newPass, 'admin', 'Administrador');
+      console.log('\nBloque generado para src/security.js:\n');
+      console.log('Object.freeze(' + JSON.stringify(generated, null, 2) + ')\n');
+      process.exit(0);
     }
-    const generated = generateCredentialsConfig(newUser, newPass);
-    console.log('\nReemplaza DEFAULT_ADMIN_AUTH en src/security.js con este bloque:\n');
-    console.log('const DEFAULT_ADMIN_AUTH = Object.freeze(' + JSON.stringify(generated, null, 2) + ');\n');
-    process.exit(0);
-  }
-
-  if (cmd === 'cifrar-clave-correo') {
-    const appPass = process.argv[3];
-    if (!appPass) {
-      console.error('Uso: node src/security.js cifrar-clave-correo "tu_clave_de_aplicacion"');
-      process.exit(1);
-    }
-    console.log('\nClave de aplicación cifrada (AES-256-GCM):\n');
-    console.log(encryptSecret(appPass) + '\n');
-    process.exit(0);
+    console.error('Uso: node src/security.js generar-credenciales "admin|viewer" "Etiqueta" "USUARIO" "Clave"');
+    process.exit(1);
   }
 }
 
 module.exports = {
   SESSION_COOKIE_NAME,
   SESSION_TTL_MS,
+  DEFAULT_ACCOUNTS,
   DEFAULT_ADMIN_AUTH,
   generateCredentialsConfig,
+  verifyAccountCredentials,
   verifyAdminCredentials,
   isEncryptedSecret,
   encryptSecret,

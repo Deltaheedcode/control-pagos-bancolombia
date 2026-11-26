@@ -5,6 +5,8 @@
 
   const state = {
     authenticated: false,
+    role: 'viewer',
+    userLabel: '',
     period: 'today',
     customStart: '',
     customEnd: '',
@@ -119,10 +121,38 @@
     document.getElementById('loginPass').value = '';
   }
 
-  async function showAuthenticatedApp() {
+  function applyRolePermissions() {
+    const isAdmin = state.role === 'admin';
+    document.querySelectorAll('[data-admin-only="true"]').forEach((el) => {
+      if (isAdmin) {
+        el.classList.remove('hidden');
+      } else {
+        el.classList.add('hidden');
+      }
+    });
+
+    const roleBadge = document.getElementById('roleBadge');
+    if (roleBadge) {
+      roleBadge.textContent = isAdmin
+        ? `🛡️ ${state.userLabel || 'Administrador'}`
+        : `📱 ${state.userLabel || 'Celular'} • Solo Lectura`;
+    }
+
+    const senderBadge = document.getElementById('officialSenderBadge');
+    if (senderBadge) {
+      senderBadge.style.cursor = isAdmin ? 'pointer' : 'default';
+      senderBadge.title = isAdmin ? 'Haz clic para cambiar remitente oficial' : '';
+    }
+  }
+
+  async function showAuthenticatedApp(roleInfo = {}) {
     state.authenticated = true;
+    if (roleInfo.role) state.role = roleInfo.role;
+    if (roleInfo.label) state.userLabel = roleInfo.label;
+
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('appRoot').classList.remove('hidden');
+    applyRolePermissions();
     renderVoiceControls();
     await loadInitialState();
     await loadPayments(false);
@@ -225,6 +255,11 @@
     }
 
     const senders = st.officialSenders || [];
+    if (state.role !== 'admin') {
+      senderBadge.textContent = '✔ Verificación Oficial Activa';
+      senderBadge.className = 'sender-pill';
+      return;
+    }
     const label = senders.length > 0 ? senders.join(', ') : 'No definido';
     const isTestSender = senders.some((s) => s.includes('jhocamza@gmail.com'));
     senderBadge.textContent = isTestSender
@@ -335,12 +370,16 @@
       return;
     }
 
+    const isAdmin = state.role === 'admin';
     tbody.innerHTML = payments
       .map((p) => {
         const testTag = p.is_test ? '<span class="tag-test">PRUEBA</span>' : '';
         const subInfo = p.payer
           ? `De: ${escapeHtml(p.payer)}`
           : escapeHtml((p.subject || '').slice(0, 55));
+        const deleteBtnHtml = isAdmin
+          ? `<button class="btn btn-danger-ghost btn-delete" data-id="${p.id}" title="Eliminar registro">✕</button>`
+          : '';
         return `
           <tr>
             <td style="white-space: nowrap; font-size: 0.83rem;">${escapeHtml(formatDateTime(p.received_at))}</td>
@@ -357,9 +396,7 @@
               <button class="btn btn-outline btn-sm btn-replay" data-phrase="${escapeHtml(p.voice_phrase)}" title="Repetir lectura en voz alta">
                 🔊
               </button>
-              <button class="btn btn-danger-ghost btn-delete" data-id="${p.id}" title="Eliminar registro">
-                ✕
-              </button>
+              ${deleteBtnHtml}
             </td>
           </tr>
         `;
@@ -373,9 +410,13 @@
     let res = await apiFetch('/api/state');
     if (!res || !res.ok) return;
 
-    // Si Render despertó tras reposo sin clave en memoria, restaurarla automáticamente desde la bóveda cifrada AES-256-GCM
+    if (res.role) state.role = res.role;
+    if (res.userLabel) state.userLabel = res.userLabel;
+    applyRolePermissions();
+
+    // Sincronizar/restaurar siempre desde la bóveda sellada AES-256-GCM (idempotente) para que ni claves ni pagos se pierdan
     const savedVault = localStorage.getItem(VAULT_STORAGE_KEY);
-    if (res.settings && !res.settings.has_password && savedVault) {
+    if (savedVault) {
       const restored = await apiFetch('/api/settings/restore-vault', {
         method: 'POST',
         body: JSON.stringify({ encryptedVault: savedVault })
@@ -445,6 +486,9 @@
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === 'new_payment' && msg.payment) {
+          if (msg.encryptedVault) {
+            localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
+          }
           if (msg.announceVoice) {
             speakText(msg.payment.voice_phrase, false);
           }
@@ -467,6 +511,9 @@
           }
           loadPayments(false);
         } else if (msg.type === 'payments_changed') {
+          if (msg.encryptedVault) {
+            localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
+          }
           loadPayments(false);
         } else if (msg.type === 'watcher_status') {
           renderWatcherStatus(msg.status);
@@ -499,6 +546,7 @@
 
   // --- MODALES ---
   function openSettingsModal() {
+    if (state.role !== 'admin') return;
     const s = state.settings || {};
     document.getElementById('cfgBusinessName').value = s.business_name || 'Control de Pagos Bancolombia';
     document.getElementById('cfgProvider').value = s.email_provider || 'gmail';
@@ -550,6 +598,7 @@
   }
 
   async function openPhonesModal(selectedIp = '') {
+    if (state.role !== 'admin') return;
     document.getElementById('modalPhones').classList.remove('hidden');
     const url = selectedIp
       ? `/api/network-info?ip=${encodeURIComponent(selectedIp)}`
@@ -579,6 +628,7 @@
   }
 
   function downloadPdfReport() {
+    if (state.role !== 'admin') return;
     const qs = buildPeriodQueryString();
     window.location.href = `/api/report/pdf?${qs}`;
   }
@@ -625,7 +675,7 @@
 
         if (resp.ok && data.ok) {
           userEl.value = '';
-          await showAuthenticatedApp();
+          await showAuthenticatedApp({ role: data.role, label: data.label });
         } else {
           errEl.textContent = data.error || 'Credenciales inválidas.';
           errEl.classList.remove('hidden');
@@ -872,7 +922,7 @@
       }).then((r) => r.json());
 
       if (sessionResp && sessionResp.authenticated) {
-        await showAuthenticatedApp();
+        await showAuthenticatedApp({ role: sessionResp.role, label: sessionResp.label });
       } else {
         showLoginScreen();
       }

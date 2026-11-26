@@ -107,12 +107,16 @@ test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y c
   assert.equal(outgoing.reason, 'outgoing_transaction');
 });
 
-test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en SQLite, 3 teléfonos y revocación', async () => {
-  // Credenciales efímeras generadas solo en memoria para el test
-  const ephemeralAuth = security.generateCredentialsConfig('USUARIO_TEST', 'ClaveEfimera#Test99');
+test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AES-256-GCM y persistencia', async () => {
+  // Cuentas efímeras generadas solo en memoria para el test (1 Admin + 2 Celulares solo lectura)
+  const ephemeralAccounts = [
+    security.generateCredentialsConfig('ADMIN_TEST', 'ClaveEfimeraAdmin#99', 'admin', 'Administrador'),
+    security.generateCredentialsConfig('CEL1_TEST', 'ClaveEfimeraCel1#99', 'viewer', 'Celular 1'),
+    security.generateCredentialsConfig('CEL2_TEST', 'ClaveEfimeraCel2#99', 'viewer', 'Celular 2')
+  ];
   const { server } = createAppServer({
     autoStartWatcher: false,
-    authConfig: ephemeralAuth
+    authConfig: ephemeralAccounts
   });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -152,23 +156,76 @@ test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en 
         'Content-Type': 'application/json',
         'X-Forwarded-For': '198.51.100.77'
       },
-      body: JSON.stringify({ username: 'USUARIO_TEST', password: 'ClaveEfimera#Test99' })
+      body: JSON.stringify({ username: 'ADMIN_TEST', password: 'ClaveEfimeraAdmin#99' })
     });
     assert.equal(lockedResp.status, 429);
 
-    // 4. Inicio de sesión legítimo y cookie HttpOnly
+    // 4. Inicio de sesión legítimo de Admin y de los 2 Celulares
     const loginResp = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Forwarded-For': '198.51.100.10'
       },
-      body: JSON.stringify({ username: 'USUARIO_TEST', password: 'ClaveEfimera#Test99' })
+      body: JSON.stringify({ username: 'ADMIN_TEST', password: 'ClaveEfimeraAdmin#99' })
     });
     assert.equal(loginResp.status, 200);
+    const loginAdminJson = await loginResp.json();
+    assert.equal(loginAdminJson.role, 'admin');
     const setCookie = loginResp.headers.get('set-cookie') || '';
     assert.match(setCookie, /HttpOnly/i);
     const cookieHeader = setCookie.split(';')[0];
+
+    const cel1Resp = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.11' },
+      body: JSON.stringify({ username: 'CEL1_TEST', password: 'ClaveEfimeraCel1#99' })
+    });
+    assert.equal(cel1Resp.status, 200);
+    const cel1Json = await cel1Resp.json();
+    assert.equal(cel1Json.role, 'viewer');
+    const cel1Cookie = (cel1Resp.headers.get('set-cookie') || '').split(';')[0];
+
+    const cel2Resp = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.12' },
+      body: JSON.stringify({ username: 'CEL2_TEST', password: 'ClaveEfimeraCel2#99' })
+    });
+    assert.equal(cel2Resp.status, 200);
+    const cel2Cookie = (cel2Resp.headers.get('set-cookie') || '').split(';')[0];
+
+    // Verificar que los celulares (viewer) NO tienen acceso a configuración, simulador, QR ni borrado (403 Forbidden)
+    const forbiddenSettings = await fetch(`${baseUrl}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cel1Cookie },
+      body: JSON.stringify({ official_senders: 'intruso@correo.com' })
+    });
+    assert.equal(forbiddenSettings.status, 403);
+
+    const forbiddenSim = await fetch(`${baseUrl}/api/payments/simulate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cel1Cookie },
+      body: JSON.stringify({ amount: 999999 })
+    });
+    assert.equal(forbiddenSim.status, 403);
+
+    const forbiddenQr = await fetch(`${baseUrl}/api/network-info`, {
+      headers: { Cookie: cel1Cookie }
+    });
+    assert.equal(forbiddenQr.status, 403);
+
+    const forbiddenPdf = await fetch(`${baseUrl}/api/report/pdf?period=today`, {
+      headers: { Cookie: cel1Cookie }
+    });
+    assert.equal(forbiddenPdf.status, 403);
+
+    // Verificar que /api/state en celular oculta correos sensibles
+    const viewerState = await fetch(`${baseUrl}/api/state`, {
+      headers: { Cookie: cel1Cookie }
+    }).then((r) => r.json());
+    assert.equal(viewerState.role, 'viewer');
+    assert.equal(viewerState.settings.email_user, undefined);
+    assert.equal(viewerState.settings.official_senders, undefined);
 
     // 5. Verificar que guardar una clave de aplicación nunca la expone por API y queda cifrada en SQLite
     const saveRes = await fetch(`${baseUrl}/api/settings`, {
@@ -222,11 +279,12 @@ test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en 
     // Limpiar clave temporal de prueba
     db.updateSettings({ email_pass: '' }, 0);
 
-    // 6. Conectar 3 pantallas autenticadas (PC + 2 teléfonos) y verificar alerta de voz + PDF
+    // 6. Conectar 1 Admin + Celular 1 + Celular 2 vía WebSocket y verificar que TODOS reciben confirmación y voz,
+    // pero los celulares reciben el correo remitente redactado y no pueden borrar pagos
     const clients = [
       new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } }),
-      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } }),
-      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } })
+      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cel1Cookie } }),
+      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cel2Cookie } })
     ];
 
     await Promise.all(
@@ -262,6 +320,17 @@ test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en 
     const alerts = await Promise.all(broadcastPromises);
     assert.equal(alerts.length, 3);
     assert.equal(alerts[0].payment.voice_phrase, 'Has recibido ochenta y cinco mil pesos');
+    assert.equal(alerts[1].payment.voice_phrase, 'Has recibido ochenta y cinco mil pesos');
+    assert.equal(alerts[2].payment.voice_phrase, 'Has recibido ochenta y cinco mil pesos');
+    assert.equal(alerts[1].payment.sender_email, 'Correo Oficial Verificado');
+    assert.equal(alerts[2].payment.sender_email, 'Correo Oficial Verificado');
+
+    // Verificar que Celular 1 no puede borrar el pago (403)
+    const forbiddenDel = await fetch(`${baseUrl}/api/payments/${simRes.payment.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: cel1Cookie }
+    });
+    assert.equal(forbiddenDel.status, 403);
 
     const pdfResp = await fetch(`${baseUrl}/api/report/pdf?period=today`, {
       headers: { Cookie: cookieHeader }

@@ -71,13 +71,16 @@
         </div>
 
         <div class="topbar-actions">
-          <button class="btn btn-dark" id="btnOpenPhones" title="Conectar 2 o 3 celulares">
+          <span id="roleBadge" style="font-size: 0.78rem; font-weight: 700; padding: 6px 11px; border-radius: 999px; background: #1e293b; color: #fdda24; border: 1px solid #334155;">
+            🛡️ Administrador
+          </span>
+          <button class="btn btn-dark" id="btnOpenPhones" data-admin-only="true" title="Conectar 2 o 3 celulares">
             📱 Teléfonos (<span id="deviceCount">1</span>)
           </button>
-          <button class="btn btn-dark" id="btnOpenSimulate" title="Probar alerta y voz ahora">
+          <button class="btn btn-dark" id="btnOpenSimulate" data-admin-only="true" title="Probar alerta y voz ahora">
             ⚡ Simular Pago
           </button>
-          <button class="btn btn-yellow" id="btnOpenSettings">
+          <button class="btn btn-yellow" id="btnOpenSettings" data-admin-only="true">
             ⚙️ Configurar Correo
           </button>
           <button class="btn btn-dark" id="btnLogout" title="Cerrar sesión">
@@ -164,7 +167,7 @@
               <span style="font-size: 0.86rem; color: #e2e8f0;">
                 <strong id="heroCount">0</strong> pagos verificados
               </span>
-              <button class="btn btn-yellow btn-sm" id="btnDownloadPdfTop">
+              <button class="btn btn-yellow btn-sm" id="btnDownloadPdfTop" data-admin-only="true">
                 📄 Descargar Reporte PDF
               </button>
             </div>
@@ -185,7 +188,7 @@
           </div>
 
           <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-green btn-sm" id="btnDownloadPdfBottom">
+            <button class="btn btn-green btn-sm" id="btnDownloadPdfBottom" data-admin-only="true">
               📄 Descargar PDF Detallado
             </button>
           </div>

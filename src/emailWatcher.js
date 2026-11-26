@@ -393,7 +393,7 @@ class EmailWatcher extends EventEmitter {
       const { inserted, payment } = db.insertPayment(analysis.payment, false);
       if (inserted && payment) {
         const ageMs = Date.now() - new Date(payment.received_at).getTime();
-        const shouldSpeak = isLiveEvent || manual || !isInitialScan || ageMs < 180000;
+        const shouldSpeak = isLiveEvent || manual || (!isInitialScan && ageMs < 180000) || ageMs < 90000;
         this.emit('payment', { payment, announceVoice: shouldSpeak });
         return 1;
       }
@@ -511,17 +511,34 @@ class EmailWatcher extends EventEmitter {
           }
         }
       } else {
-        // Escaneo inicial o manual por fecha
+        // Escaneo inicial o manual: recuperar también pagos recientes del remitente oficial (hasta 30 días)
+        // para que nunca se pierda historial aunque el servidor en la nube se haya reiniciado
         const sinceDate = new Date();
-        if (lookback === '7days') {
+        if (isInitialScan) {
+          sinceDate.setDate(sinceDate.getDate() - 30);
+          sinceDate.setHours(0, 0, 0, 0);
+        } else if (lookback === '7days') {
           sinceDate.setDate(sinceDate.getDate() - 7);
           sinceDate.setHours(0, 0, 0, 0);
         } else {
           sinceDate.setHours(0, 0, 0, 0);
         }
 
-        const searchedUids = await this.client.search({ since: sinceDate }, { uid: true });
-        const recentSlice = (searchedUids || []).slice(-60);
+        let recentSlice = [];
+        const cleanSenders = officialSenders.filter((s) => !s.startsWith('*'));
+
+        if (isInitialScan && cleanSenders.length > 0 && cleanSenders.length <= 6) {
+          const uidSet = new Set();
+          for (const sender of cleanSenders) {
+            const senderTerm = sender.startsWith('@') ? sender.slice(1) : sender;
+            const found = await this.client.search({ since: sinceDate, from: senderTerm }, { uid: true });
+            for (const u of found || []) uidSet.add(u);
+          }
+          recentSlice = Array.from(uidSet).sort((a, b) => a - b).slice(-150);
+        } else {
+          const searchedUids = await this.client.search({ since: sinceDate }, { uid: true });
+          recentSlice = (searchedUids || []).slice(-60);
+        }
 
         if (recentSlice.length > 0) {
           const filtered = [];
