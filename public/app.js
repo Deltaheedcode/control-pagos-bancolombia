@@ -364,9 +364,33 @@
       .join('');
   }
 
+  const VAULT_STORAGE_KEY = 'bcol_encrypted_vault_v1';
+
   async function loadInitialState() {
-    const res = await apiFetch('/api/state');
+    let res = await apiFetch('/api/state');
     if (!res || !res.ok) return;
+
+    // Si Render despertó tras reposo sin clave en memoria, restaurarla automáticamente desde la bóveda cifrada AES-256-GCM
+    const savedVault = localStorage.getItem(VAULT_STORAGE_KEY);
+    if (res.settings && !res.settings.has_password && savedVault) {
+      const restored = await apiFetch('/api/settings/restore-vault', {
+        method: 'POST',
+        body: JSON.stringify({ encryptedVault: savedVault })
+      });
+      if (restored && restored.ok && restored.restored) {
+        res = {
+          ...res,
+          settings: restored.settings,
+          encryptedVault: restored.encryptedVault,
+          watcherStatus: restored.watcherStatus
+        };
+      }
+    }
+
+    if (res.encryptedVault) {
+      localStorage.setItem(VAULT_STORAGE_KEY, res.encryptedVault);
+    }
+
     state.settings = res.settings || {};
     document.getElementById('businessTitle').textContent =
       state.settings.business_name || 'Control de Pagos Bancolombia';
@@ -421,7 +445,24 @@
           if (msg.announceVoice) {
             speakText(msg.payment.voice_phrase, false);
           }
-          loadPayments(true);
+          // Renderizado instantáneo en 0ms sin esperar consulta HTTP adicional
+          if (state.period === 'today' || state.period === '7days' || state.period === 'month' || state.period === 'all') {
+            const exists = state.payments.some((p) => p.id === msg.payment.id);
+            if (!exists) {
+              const updatedList = [msg.payment, ...state.payments];
+              const newTotal = updatedList.reduce((acc, p) => acc + Number(p.amount || 0), 0);
+              renderPayments(
+                {
+                  periodLabel: state.period === 'today' ? 'Hoy' : 'Periodo actual',
+                  payments: updatedList,
+                  total_amount: newTotal,
+                  formatted_total: NumberToSpanish.formatCOP(newTotal)
+                },
+                true
+              );
+            }
+          }
+          loadPayments(false);
         } else if (msg.type === 'payments_changed') {
           loadPayments(false);
         } else if (msg.type === 'watcher_status') {
@@ -429,6 +470,9 @@
         } else if (msg.type === 'devices') {
           renderDevices(msg.devices);
         } else if (msg.type === 'settings_updated') {
+          if (msg.encryptedVault) {
+            localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
+          }
           if (msg.settings) {
             state.settings = msg.settings;
             document.getElementById('businessTitle').textContent =
@@ -461,8 +505,8 @@
     // Jamás se rellena ni expone la clave de aplicación
     document.getElementById('cfgEmailPass').value = '';
     document.getElementById('passSavedHint').textContent = s.has_password
-      ? '🔒 Clave de aplicación cifrada con AES-256-GCM y oculta permanentemente. Déjalo vacío para conservarla.'
-      : 'Aún no has guardado la contraseña de aplicación.';
+      ? '🔒 Bóveda cifrada AES-256-GCM activa: tu clave permanece oculta y se restaura automáticamente aunque Render entre en reposo.'
+      : 'Ingresa tu clave una vez; quedará respaldada con cifrado AES-256-GCM aunque Render entre en reposo.';
     document.getElementById('cfgOfficialSenders').value = s.official_senders || TEST_SENDER_EMAIL;
     document.getElementById('cfgLookback').value = s.sync_lookback || 'today';
     document.getElementById('settingsFeedback').classList.add('hidden');
@@ -715,6 +759,9 @@
       });
 
       if (res && res.ok) {
+        if (res.encryptedVault) {
+          localStorage.setItem(VAULT_STORAGE_KEY, res.encryptedVault);
+        }
         state.settings = res.settings;
         renderWatcherStatus(res.watcherStatus);
         document.getElementById('businessTitle').textContent =
@@ -800,6 +847,20 @@
         el.textContent = timeAgo(el.dataset.iso);
       }
     }, 15000);
+
+    // Keep-alive HTTP cada 8 minutos mientras esté abierto para evitar que Render entre en reposo
+    setInterval(() => {
+      if (state.authenticated) {
+        fetch('/api/health', { cache: 'no-store' }).catch(() => {});
+        const savedVault = localStorage.getItem(VAULT_STORAGE_KEY);
+        if (savedVault && state.watcherStatus && state.watcherStatus.state === 'unconfigured') {
+          apiFetch('/api/settings/restore-vault', {
+            method: 'POST',
+            body: JSON.stringify({ encryptedVault: savedVault })
+          }).catch(() => {});
+        }
+      }
+    }, 8 * 60 * 1000);
 
     // Verificar si ya existe cookie de sesión activa al cargar la página
     try {

@@ -20,7 +20,6 @@ function resolveImapConfig(settings) {
   const user = (settings.email_user || '').trim();
   let pass = settings.email_pass || '';
 
-  // En Gmail las contraseñas de aplicación suelen copiarse con espacios ("abcd efgh ijkl mnop")
   if (provider === 'gmail' && /^[a-zA-Z]{4}(\s+[a-zA-Z]{4}){3}$/.test(pass.trim())) {
     pass = pass.replace(/\s+/g, '');
   }
@@ -65,11 +64,12 @@ class EmailWatcher extends EventEmitter {
     this.client = null;
     this.running = false;
     this.scanning = false;
+    this.pendingLiveCheck = false;
     this.lastSeenUid = 0;
     this.reconnectTimer = null;
     this.pollInterval = null;
     this.status = {
-      state: 'unconfigured', // 'unconfigured' | 'connecting' | 'connected' | 'error' | 'stopped'
+      state: 'unconfigured',
       message: 'Configura la Contraseña de Aplicación de tu correo para iniciar la lectura automática.',
       lastCheckAt: null,
       emailUser: '',
@@ -109,7 +109,7 @@ class EmailWatcher extends EventEmitter {
     if (!cfg.user || !cfg.pass || !cfg.host) {
       return {
         ok: false,
-        error: 'Debes ingresar el correo electrónico y la contraseña / contraseña de aplicación.'
+        error: 'Debes ingresar el correo electrónico y la contraseña de aplicación.'
       };
     }
 
@@ -119,6 +119,7 @@ class EmailWatcher extends EventEmitter {
       secure: cfg.secure,
       auth: { user: cfg.user, pass: cfg.pass },
       logger: false,
+      disableAutoIdle: true,
       connectionTimeout: 15000,
       greetingTimeout: 15000
     });
@@ -152,6 +153,7 @@ class EmailWatcher extends EventEmitter {
 
   async stop() {
     this.running = false;
+    this.pendingLiveCheck = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -198,12 +200,15 @@ class EmailWatcher extends EventEmitter {
       message: `Conectando a ${cfg.user} (${cfg.host})...`
     });
 
+    // autoIdleDelay=800ms hace que entre en escucha instantánea IDLE casi de inmediato (<1s)
     const client = new ImapFlow({
       host: cfg.host,
       port: cfg.port,
       secure: cfg.secure,
       auth: { user: cfg.user, pass: cfg.pass },
       logger: false,
+      autoIdleDelay: 800,
+      maxIdleTime: 240000,
       connectionTimeout: 20000,
       greetingTimeout: 15000
     });
@@ -216,18 +221,19 @@ class EmailWatcher extends EventEmitter {
         state: 'error',
         message: translateImapError(err, cfg.provider)
       });
-      this._scheduleReconnect(10000);
+      this._scheduleReconnect(8000);
     });
 
     client.on('close', () => {
       if (!this.running || this.client !== client) return;
       this.setStatus({
         state: 'connecting',
-        message: 'Conexión cerrada por el servidor, reconectando automáticamente...'
+        message: 'Conexión IMAP renovándose automáticamente...'
       });
-      this._scheduleReconnect(5000);
+      this._scheduleReconnect(3000);
     });
 
+    // Notificación push instantánea del servidor de correo cuando entra un mensaje nuevo
     client.on('exists', () => {
       if (!this.running || this.client !== client) return;
       this.checkNow({ isLiveEvent: true }).catch(() => {});
@@ -235,6 +241,10 @@ class EmailWatcher extends EventEmitter {
 
     try {
       await client.connect();
+      if (client.socket && typeof client.socket.setNoDelay === 'function') {
+        client.socket.setNoDelay(true);
+      }
+
       const mailbox = await client.mailboxOpen('INBOX');
 
       const lookback = settings.sync_lookback || 'today';
@@ -244,20 +254,24 @@ class EmailWatcher extends EventEmitter {
 
       this.setStatus({
         state: 'connected',
-        message: `Monitoreando ${cfg.user} en tiempo real`,
+        message: `Monitoreando ${cfg.user} en tiempo real (IDLE instantáneo)`,
         lastCheckAt: new Date().toISOString()
       });
 
-      // Escaneo inicial según configuración
       await this.checkNow({ isInitialScan: true });
 
-      // Respaldo periódico cada 20s por si el router corta paquetes IDLE silenciosamente
+      // Fijar el último UID conocido tras el escaneo inicial para que todo evento posterior sea directo
+      if (client.mailbox && client.mailbox.uidNext) {
+        this.lastSeenUid = Math.max(this.lastSeenUid, client.mailbox.uidNext - 1);
+      }
+
+      // Respaldo cada 75s para no interrumpir constantemente el modo IDLE en tiempo real
       if (this.pollInterval) clearInterval(this.pollInterval);
       this.pollInterval = setInterval(() => {
-        if (this.running && this.client === client) {
+        if (this.running && this.client === client && !this.scanning) {
           this.checkNow({ isLiveEvent: true }).catch(() => {});
         }
-      }, 20000);
+      }, 75000);
     } catch (err) {
       if (this.client === client) {
         this.client = null;
@@ -272,10 +286,9 @@ class EmailWatcher extends EventEmitter {
         message: friendly
       });
 
-      // Si es error de credenciales no reintentar cada 5s agresivamente
       const isAuthErr = friendly.includes('rechazó');
       if (!isAuthErr && this.running) {
-        this._scheduleReconnect(12000);
+        this._scheduleReconnect(10000);
       }
     }
   }
@@ -305,6 +318,9 @@ class EmailWatcher extends EventEmitter {
     }
 
     if (this.scanning) {
+      if (isLiveEvent || manual) {
+        this.pendingLiveCheck = true;
+      }
       return { checked: 0, added: 0, busy: true };
     }
 
@@ -317,47 +333,109 @@ class EmailWatcher extends EventEmitter {
       const officialSenders = parser.normalizeSenderList(settings.official_senders);
       const lookback = settings.sync_lookback || 'today';
 
-      let searchQuery;
+      let candidateUids = [];
+
       if (this.lastSeenUid > 0 && !manual) {
-        searchQuery = { uid: `${this.lastSeenUid + 1}:*` };
+        // Vía rápida directa en 1 solo viaje de red: leer sobres desde lastSeenUid + 1 sin SEARCH previo
+        const matchingNewUids = [];
+        const currentMaxNext = this.client.mailbox && this.client.mailbox.uidNext
+          ? this.client.mailbox.uidNext
+          : this.lastSeenUid + 1;
+
+        if (currentMaxNext > this.lastSeenUid) {
+          for await (const envMsg of this.client.fetch(
+            `${this.lastSeenUid + 1}:*`,
+            { uid: true, envelope: true },
+            { uid: true }
+          )) {
+            if (envMsg.uid <= this.lastSeenUid) continue;
+            this.lastSeenUid = Math.max(this.lastSeenUid, envMsg.uid);
+            checked += 1;
+
+            const envMsgId =
+              envMsg.envelope && envMsg.envelope.messageId
+                ? String(envMsg.envelope.messageId).trim()
+                : `imap-uid-${envMsg.uid}`;
+
+            if (db.hasMessageId(envMsgId)) continue;
+
+            const envFrom =
+              envMsg.envelope &&
+              Array.isArray(envMsg.envelope.from) &&
+              envMsg.envelope.from[0] &&
+              envMsg.envelope.from[0].address
+                ? String(envMsg.envelope.from[0].address).toLowerCase()
+                : '';
+
+            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
+              continue;
+            }
+            matchingNewUids.push(envMsg.uid);
+          }
+        }
+        candidateUids = matchingNewUids;
       } else {
+        // Escaneo inicial o manual por fecha
         const sinceDate = new Date();
         if (lookback === '7days') {
           sinceDate.setDate(sinceDate.getDate() - 7);
           sinceDate.setHours(0, 0, 0, 0);
         } else {
-          // Por defecto revisar correos de hoy (restando margen por zonas horarias IMAP)
           sinceDate.setHours(0, 0, 0, 0);
         }
-        searchQuery = { since: sinceDate };
+
+        const searchedUids = await this.client.search({ since: sinceDate }, { uid: true });
+        const recentSlice = (searchedUids || []).slice(-60);
+
+        if (recentSlice.length > 0) {
+          const filtered = [];
+          for await (const envMsg of this.client.fetch(
+            recentSlice,
+            { uid: true, envelope: true },
+            { uid: true }
+          )) {
+            this.lastSeenUid = Math.max(this.lastSeenUid, envMsg.uid);
+            checked += 1;
+
+            const envMsgId =
+              envMsg.envelope && envMsg.envelope.messageId
+                ? String(envMsg.envelope.messageId).trim()
+                : `imap-uid-${envMsg.uid}`;
+
+            if (db.hasMessageId(envMsgId)) continue;
+
+            const envFrom =
+              envMsg.envelope &&
+              Array.isArray(envMsg.envelope.from) &&
+              envMsg.envelope.from[0] &&
+              envMsg.envelope.from[0].address
+                ? String(envMsg.envelope.from[0].address).toLowerCase()
+                : '';
+
+            if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
+              continue;
+            }
+            filtered.push(envMsg.uid);
+          }
+          candidateUids = filtered;
+        }
       }
 
-      const uids = await this.client.search(searchQuery, { uid: true });
-      const validUids = (uids || []).filter((uid) => (manual ? true : uid > this.lastSeenUid));
-
-      // Limitar a los últimos 60 mensajes en escaneo inicial/manual para máxima velocidad
-      const targetUids = validUids.slice(-60);
-
-      if (targetUids.length > 0) {
+      // Descargar cuerpo completo ÚNICAMENTE de los mensajes del remitente oficial autorizado
+      if (candidateUids.length > 0) {
         for await (const msg of this.client.fetch(
-          targetUids,
+          candidateUids,
           { uid: true, envelope: true, source: true, internalDate: true },
           { uid: true }
         )) {
-          checked += 1;
-          if (msg.uid > this.lastSeenUid) {
-            this.lastSeenUid = msg.uid;
-          }
+          const envelopeMsgId =
+            msg.envelope && msg.envelope.messageId
+              ? String(msg.envelope.messageId).trim()
+              : `imap-uid-${msg.uid}`;
 
-          const envelopeMsgId = msg.envelope && msg.envelope.messageId
-            ? String(msg.envelope.messageId).trim()
-            : `imap-uid-${msg.uid}`;
+          if (db.hasMessageId(envelopeMsgId)) continue;
 
-          if (db.hasMessageId(envelopeMsgId)) {
-            continue;
-          }
-
-          // Filtrado rápido por remitente usando el sobre antes de parsear MIME completo si hay muchos correos
+          const parsed = await simpleParser(msg.source);
           const envFrom =
             msg.envelope &&
             Array.isArray(msg.envelope.from) &&
@@ -366,20 +444,13 @@ class EmailWatcher extends EventEmitter {
               ? String(msg.envelope.from[0].address).toLowerCase()
               : '';
 
-          if (envFrom && !parser.isSenderAuthorized(envFrom, officialSenders)) {
-            continue;
-          }
-
-          const parsed = await simpleParser(msg.source);
           const fromObj =
             parsed.from && Array.isArray(parsed.from.value) && parsed.from.value[0]
               ? parsed.from.value[0]
               : { address: envFrom, name: '' };
 
           const messageId = (parsed.messageId || envelopeMsgId).trim();
-          if (db.hasMessageId(messageId)) {
-            continue;
-          }
+          if (db.hasMessageId(messageId)) continue;
 
           const analysis = parser.analyzeEmailForPayment({
             fromAddress: fromObj.address,
@@ -397,9 +468,8 @@ class EmailWatcher extends EventEmitter {
             const { inserted, payment } = db.insertPayment(analysis.payment, false);
             if (inserted && payment) {
               added += 1;
-              // Anunciar con voz si llegó en vivo, o si fue recibido hace menos de 3 minutos
               const ageMs = Date.now() - new Date(payment.received_at).getTime();
-              const shouldSpeak = isLiveEvent || manual || (!isInitialScan) || ageMs < 180000;
+              const shouldSpeak = isLiveEvent || manual || !isInitialScan || ageMs < 180000;
               this.emit('payment', { payment, announceVoice: shouldSpeak });
             }
           } else if (analysis.reason !== 'unauthorized_sender') {
@@ -432,6 +502,12 @@ class EmailWatcher extends EventEmitter {
       });
     } finally {
       this.scanning = false;
+      if (this.pendingLiveCheck && this.running) {
+        this.pendingLiveCheck = false;
+        setImmediate(() => {
+          this.checkNow({ isLiveEvent: true }).catch(() => {});
+        });
+      }
     }
 
     return { checked, added };

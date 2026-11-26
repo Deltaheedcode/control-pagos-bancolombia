@@ -64,7 +64,8 @@ const DEFAULT_SETTINGS = {
   imap_tls: process.env.IMAP_TLS || 'true',
   official_senders: process.env.OFFICIAL_SENDERS || 'jhocamza@gmail.com',
   sync_lookback: process.env.SYNC_LOOKBACK || 'today',
-  voice_enabled_default: 'true'
+  voice_enabled_default: 'true',
+  settings_updated_at: initialEnvPass ? String(Date.now()) : '0'
 };
 
 const insertDefaultStmt = db.prepare(
@@ -109,27 +110,91 @@ function getAllSettings(includeSecrets = false) {
   };
 }
 
-function updateSettings(partial) {
+function updateSettings(partial, customTimestamp = null) {
   const upsert = db.prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
 
-  const allowedKeys = Object.keys(DEFAULT_SETTINGS);
+  const allowedKeys = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'settings_updated_at');
+  let changedAny = false;
+
   for (const key of allowedKeys) {
     if (Object.prototype.hasOwnProperty.call(partial, key) && partial[key] !== undefined) {
       if (key === 'email_pass') {
         const val = String(partial.email_pass || '');
         if (val === '__KEEP__') continue;
-        // Guardar siempre cifrada con AES-256-GCM en disco
         const encryptedVal = val ? security.encryptSecret(val) : '';
         upsert.run('email_pass', encryptedVal);
+        changedAny = true;
         continue;
       }
       upsert.run(key, String(partial[key]));
+      changedAny = true;
     }
   }
+
+  if (changedAny) {
+    upsert.run('settings_updated_at', String(customTimestamp || Date.now()));
+  }
+
   return getAllSettings(false);
+}
+
+function exportEncryptedVault() {
+  const full = getAllSettings(true);
+  if (!full.email_pass) return null;
+
+  const payload = JSON.stringify({
+    v: 1,
+    updatedAt: Number(full.settings_updated_at) || Date.now(),
+    settings: {
+      business_name: full.business_name,
+      email_provider: full.email_provider,
+      email_user: full.email_user,
+      email_pass: full.email_pass,
+      imap_host: full.imap_host,
+      imap_port: full.imap_port,
+      imap_tls: full.imap_tls,
+      official_senders: full.official_senders,
+      sync_lookback: full.sync_lookback,
+      voice_enabled_default: full.voice_enabled_default
+    }
+  });
+
+  return security.encryptSecret(payload);
+}
+
+function restoreEncryptedVault(vaultToken) {
+  if (!vaultToken || !security.isEncryptedSecret(vaultToken)) {
+    return { restored: false, reason: 'invalid_format' };
+  }
+
+  const raw = security.decryptSecret(vaultToken);
+  if (!raw) {
+    return { restored: false, reason: 'decrypt_failed' };
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.v !== 1 || !parsed.settings || !parsed.settings.email_pass) {
+      return { restored: false, reason: 'invalid_payload' };
+    }
+
+    const current = getAllSettings(true);
+    const serverUpdatedAt = Number(current.settings_updated_at) || 0;
+    const vaultUpdatedAt = Number(parsed.updatedAt) || Date.now();
+
+    // Restaurar si el servidor despertó sin contraseña o si la bóveda es más reciente
+    if (!current.email_pass || vaultUpdatedAt > serverUpdatedAt) {
+      const updated = updateSettings(parsed.settings, vaultUpdatedAt);
+      return { restored: true, settings: updated };
+    }
+
+    return { restored: false, reason: 'already_up_to_date', settings: getAllSettings(false) };
+  } catch (_) {
+    return { restored: false, reason: 'corrupt_json' };
+  }
 }
 
 function enrichPaymentRow(row) {
@@ -260,6 +325,8 @@ module.exports = {
   DB_PATH,
   getAllSettings,
   updateSettings,
+  exportEncryptedVault,
+  restoreEncryptedVault,
   insertPayment,
   getPaymentById,
   hasMessageId,

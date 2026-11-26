@@ -190,6 +190,8 @@ test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en 
     assert.equal(saveRes.ok, true);
     assert.equal(saveRes.settings.has_password, true);
     assert.equal(saveRes.settings.email_pass, undefined);
+    assert.ok(saveRes.encryptedVault && saveRes.encryptedVault.startsWith('enc:gcm:v1:'));
+    assert.equal(saveRes.encryptedVault.includes('clavePruebaTemporal1234'), false);
 
     const rawDb = new DatabaseSync(db.DB_PATH, { readOnly: true });
     const rawRow = rawDb.prepare("SELECT value FROM settings WHERE key = 'email_pass'").get();
@@ -197,8 +199,28 @@ test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en 
     assert.ok(rawRow.value.startsWith('enc:gcm:v1:'));
     assert.equal(rawRow.value.includes('clavePruebaTemporal1234'), false);
 
+    // Simular que Render entró en reposo y perdió la base de datos temporal
+    db.updateSettings({ email_pass: '' }, 0);
+    assert.equal(db.getAllSettings(false).has_password, false);
+
+    // Verificar auto-restauración desde la bóveda cifrada AES-256-GCM sin volver a pedir la clave
+    const restoreRes = await fetch(`${baseUrl}/api/settings/restore-vault`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader
+      },
+      body: JSON.stringify({ encryptedVault: saveRes.encryptedVault })
+    }).then((r) => r.json());
+
+    assert.equal(restoreRes.ok, true);
+    assert.equal(restoreRes.restored, true);
+    assert.equal(restoreRes.settings.has_password, true);
+    assert.equal(restoreRes.settings.email_pass, undefined);
+    assert.equal(db.getAllSettings(true).email_pass, 'clavePruebaTemporal1234');
+
     // Limpiar clave temporal de prueba
-    db.updateSettings({ email_pass: '' });
+    db.updateSettings({ email_pass: '' }, 0);
 
     // 6. Conectar 3 pantallas autenticadas (PC + 2 teléfonos) y verificar alerta de voz + PDF
     const clients = [

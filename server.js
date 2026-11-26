@@ -304,10 +304,38 @@ function createAppServer({
     res.json({
       ok: true,
       settings: db.getAllSettings(false),
+      encryptedVault: db.exportEncryptedVault(),
       watcherStatus: emailWatcher.getStatus(),
       devices: getDevicesList(),
       officialPresets: parser.DEFAULT_BANCOLOMBIA_SENDERS,
       auditEvents: db.listAuditEvents(15)
+    });
+  });
+
+  app.post('/api/settings/restore-vault', requireAuth, async (req, res) => {
+    const { encryptedVault } = req.body || {};
+    const result = db.restoreEncryptedVault(encryptedVault);
+
+    if (result.restored && autoStartWatcher) {
+      emailWatcher.restart().catch(() => {});
+    }
+
+    const freshVault = db.exportEncryptedVault();
+    if (result.restored) {
+      broadcast({
+        type: 'settings_updated',
+        settings: result.settings,
+        encryptedVault: freshVault,
+        watcherStatus: emailWatcher.getStatus()
+      });
+    }
+
+    res.json({
+      ok: true,
+      restored: result.restored,
+      settings: db.getAllSettings(false),
+      encryptedVault: freshVault,
+      watcherStatus: emailWatcher.getStatus()
     });
   });
 
@@ -454,15 +482,19 @@ function createAppServer({
       }
     }
 
+    const freshVault = db.exportEncryptedVault();
+
     broadcast({
       type: 'settings_updated',
       settings: updated,
+      encryptedVault: freshVault,
       watcherStatus: emailWatcher.getStatus()
     });
 
     res.json({
       ok: true,
       settings: updated,
+      encryptedVault: freshVault,
       watcherStatus: emailWatcher.getStatus()
     });
   });

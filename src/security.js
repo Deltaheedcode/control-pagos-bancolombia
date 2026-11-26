@@ -61,6 +61,15 @@ function getOrCreateRuntimeMasterSecret() {
     return Buffer.from(process.env.APP_SECRET_KEY.trim(), 'utf8');
   }
 
+  // En entornos efímeros de nube (Render) sin APP_SECRET_KEY explícita, derivar llave estable
+  // para que las sesiones y bóvedas cifradas sobrevivan cuando el contenedor entra en reposo
+  if (process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
+    return crypto
+      .createHash('sha256')
+      .update(DEFAULT_ADMIN_AUTH.pHash + ':' + DEFAULT_ADMIN_AUTH.uHash + ':render-stable-v1')
+      .digest();
+  }
+
   try {
     if (fs.existsSync(VAULT_KEY_PATH)) {
       const raw = fs.readFileSync(VAULT_KEY_PATH, 'utf8').trim();
@@ -72,7 +81,6 @@ function getOrCreateRuntimeMasterSecret() {
     fs.writeFileSync(VAULT_KEY_PATH, generated.toString('hex'), { mode: 0o600 });
     return generated;
   } catch (_) {
-    // Fallback determinista de proceso en entornos de solo lectura
     return crypto.createHash('sha256').update(process.cwd() + '__runtime_vault').digest();
   }
 }
