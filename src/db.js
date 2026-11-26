@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const NumberToSpanish = require('../public/numberToSpanish');
+const security = require('./security');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -49,18 +50,21 @@ db.exec(`
   );
 `);
 
+const initialEnvPass = process.env.EMAIL_PASS
+  ? security.encryptSecret(process.env.EMAIL_PASS)
+  : '';
+
 const DEFAULT_SETTINGS = {
   business_name: process.env.BUSINESS_NAME || 'Control de Pagos Bancolombia',
   email_provider: process.env.EMAIL_PROVIDER || 'gmail',
   email_user: process.env.EMAIL_USER || 'jhocamza@gmail.com',
-  email_pass: process.env.EMAIL_PASS || '',
+  email_pass: initialEnvPass,
   imap_host: process.env.IMAP_HOST || 'imap.gmail.com',
   imap_port: process.env.IMAP_PORT || '993',
   imap_tls: process.env.IMAP_TLS || 'true',
   official_senders: process.env.OFFICIAL_SENDERS || 'jhocamza@gmail.com',
   sync_lookback: process.env.SYNC_LOOKBACK || 'today',
-  voice_enabled_default: 'true',
-  access_pin: process.env.ACCESS_PIN || ''
+  voice_enabled_default: 'true'
 };
 
 const insertDefaultStmt = db.prepare(
@@ -70,19 +74,39 @@ for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
   insertDefaultStmt.run(k, String(v));
 }
 
+// Migrar automáticamente cualquier clave previa sin cifrar hacia AES-256-GCM
+(function migratePlaintextSecrets() {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'email_pass'").get();
+  if (row && row.value && !security.isEncryptedSecret(row.value)) {
+    const encrypted = security.encryptSecret(row.value);
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'email_pass'").run(encrypted);
+  } else if ((!row || !row.value) && initialEnvPass) {
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'email_pass'").run(initialEnvPass);
+  }
+  // Eliminar antiguo PIN suelto si existía
+  db.prepare("DELETE FROM settings WHERE key = 'access_pin'").run();
+})();
+
 function getAllSettings(includeSecrets = false) {
   const rows = db.prepare('SELECT key, value FROM settings').all();
-  const result = { ...DEFAULT_SETTINGS };
+  const rawMap = { ...DEFAULT_SETTINGS };
   for (const row of rows) {
-    result[row.key] = row.value;
+    rawMap[row.key] = row.value;
   }
+
+  const decryptedPass = security.decryptSecret(rawMap.email_pass || '');
+
   if (!includeSecrets) {
-    result.has_password = Boolean(result.email_pass && result.email_pass.length > 0);
-    delete result.email_pass;
-    result.has_pin = Boolean(result.access_pin && result.access_pin.length > 0);
-    delete result.access_pin;
+    const safeResult = { ...rawMap };
+    safeResult.has_password = Boolean(decryptedPass && decryptedPass.length > 0);
+    delete safeResult.email_pass;
+    return safeResult;
   }
-  return result;
+
+  return {
+    ...rawMap,
+    email_pass: decryptedPass
+  };
 }
 
 function updateSettings(partial) {
@@ -94,9 +118,14 @@ function updateSettings(partial) {
   const allowedKeys = Object.keys(DEFAULT_SETTINGS);
   for (const key of allowedKeys) {
     if (Object.prototype.hasOwnProperty.call(partial, key) && partial[key] !== undefined) {
-      // Si envían email_pass vacío con flag keepPassword, no sobreescribir
-      if (key === 'email_pass' && partial[key] === '__KEEP__') continue;
-      if (key === 'access_pin' && partial[key] === '__KEEP__') continue;
+      if (key === 'email_pass') {
+        const val = String(partial.email_pass || '');
+        if (val === '__KEEP__') continue;
+        // Guardar siempre cifrada con AES-256-GCM en disco
+        const encryptedVal = val ? security.encryptSecret(val) : '';
+        upsert.run('email_pass', encryptedVal);
+        continue;
+      }
       upsert.run(key, String(partial[key]));
     }
   }
@@ -215,7 +244,6 @@ function logAuditEvent({ fromEmail, subject, reason, detail }) {
     new Date().toISOString()
   );
 
-  // Mantener solo los últimos 100 eventos para que no crezca indefinidamente
   db.exec(`
     DELETE FROM audit_events
     WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT 100)

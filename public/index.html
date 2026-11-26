@@ -8,369 +8,427 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <!-- Encabezado Principal -->
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand">
-        <div class="brand-badge">$</div>
-        <div>
-          <div class="brand-title" id="businessTitle">Control de Pagos Bancolombia</div>
-          <div class="brand-sub">Verificador anti-fraude por correo oficial en tiempo real</div>
-        </div>
-      </div>
+  <!-- PANTALLA DE INICIO DE SESIÓN OBLIGATORIO -->
+  <section id="loginScreen" class="login-screen">
+    <div class="login-card">
+      <div class="login-logo">$</div>
+      <h1 class="login-title">Control de Pagos Bancolombia</h1>
+      <p class="login-subtitle">Acceso protegido de administración</p>
 
-      <div class="topbar-actions">
-        <button class="btn btn-dark" id="btnOpenPhones" title="Conectar 2 o 3 celulares">
-          📱 Teléfonos (<span id="deviceCount">1</span>)
+      <form id="loginForm" autocomplete="off">
+        <div class="form-group">
+          <label class="form-label" for="loginUser">Usuario</label>
+          <input
+            type="text"
+            id="loginUser"
+            class="input"
+            placeholder="Ingresa tu usuario"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            required
+          />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="loginPass">Contraseña</label>
+          <input
+            type="password"
+            id="loginPass"
+            class="input"
+            placeholder="••••••••••••"
+            autocomplete="current-password"
+            autocapitalize="off"
+            spellcheck="false"
+            required
+          />
+        </div>
+
+        <div id="loginError" class="alert-msg err hidden"></div>
+
+        <button type="submit" id="btnLoginSubmit" class="btn btn-dark" style="width: 100%; margin-top: 10px; padding: 11px; background: #14171f;">
+          🔒 Iniciar Sesión Segura
         </button>
-        <button class="btn btn-dark" id="btnOpenSimulate" title="Probar alerta y voz ahora">
-          ⚡ Simular Pago
-        </button>
-        <button class="btn btn-yellow" id="btnOpenSettings">
-          ⚙️ Configurar Correo
-        </button>
+      </form>
+
+      <div class="security-footnote">
+        🛡️ Credenciales protegidas con derivación criptográfica <code>scrypt</code> (solo modificables por código fuente).
       </div>
     </div>
-  </header>
+  </section>
 
-  <main class="container">
-    <!-- Aviso en celulares para desbloquear altavoz del navegador -->
-    <div id="audioUnlockBanner" class="audio-unlock-banner hidden">
-      <span>🔊 Toca aquí una vez para activar el altavoz de voz en este teléfono/pantalla</span>
-      <span class="btn btn-sm btn-dark">Activar Sonido</span>
-    </div>
-
-    <!-- Barra de Estado IMAP + Remitente Oficial -->
-    <section class="status-strip">
-      <div class="status-left">
-        <span id="watcherDot" class="status-dot unconfigured"></span>
-        <div>
-          <strong id="watcherText">Cargando estado del correo...</strong>
-          <div id="lastCheckText" style="font-size: 0.77rem; color: #64748b;"></div>
-        </div>
-      </div>
-
-      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-        <span id="officialSenderBadge" class="sender-pill test-mode" title="Haz clic para cambiar remitente oficial">
-          Remitente oficial: jhocamza@gmail.com
-        </span>
-        <button class="btn btn-outline btn-sm" id="btnCheckNow">
-          🔄 Revisar Ahora
-        </button>
-      </div>
-    </section>
-
-    <!-- Sección Principal: Último Pago + Control de Voz y Total -->
-    <section class="hero-grid">
-      <!-- Tarjeta de Último Pago Verificado -->
-      <div id="latestCard" class="latest-card">
-        <div class="latest-header">
-          <span id="latestBadge" class="verified-badge">⏳ Esperando pagos verificados</span>
-          <span id="latestTimeAgo" class="latest-time-ago"></span>
-        </div>
-
-        <div id="latestContent">
-          <div class="latest-empty">
-            Aún no hay pagos en este periodo. Envía un correo desde el remitente autorizado o usa <strong>⚡ Simular Pago</strong> para probar.
+  <!-- PANEL PRINCIPAL (OCULTO HASTA AUTENTICARSE) -->
+  <div id="appRoot" class="hidden">
+    <!-- Encabezado Principal -->
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="brand-badge">$</div>
+          <div>
+            <div class="brand-title" id="businessTitle">Control de Pagos Bancolombia</div>
+            <div class="brand-sub">Verificador anti-fraude por correo oficial en tiempo real</div>
           </div>
         </div>
 
-        <div id="latestMeta" class="latest-meta hidden"></div>
+        <div class="topbar-actions">
+          <button class="btn btn-dark" id="btnOpenPhones" title="Conectar 2 o 3 celulares">
+            📱 Teléfonos (<span id="deviceCount">1</span>)
+          </button>
+          <button class="btn btn-dark" id="btnOpenSimulate" title="Probar alerta y voz ahora">
+            ⚡ Simular Pago
+          </button>
+          <button class="btn btn-yellow" id="btnOpenSettings">
+            ⚙️ Configurar Correo
+          </button>
+          <button class="btn btn-dark" id="btnLogout" title="Cerrar sesión">
+            🚪 Salir
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <!-- Aviso en celulares para desbloquear altavoz del navegador -->
+      <div id="audioUnlockBanner" class="audio-unlock-banner hidden">
+        <span>🔊 Toca aquí una vez para activar el altavoz de voz en este teléfono/pantalla</span>
+        <span class="btn btn-sm btn-dark">Activar Sonido</span>
       </div>
 
-      <!-- Columna derecha: Lectura en Voz Alta + Suma rápida y PDF -->
-      <div class="side-stack">
-        <div class="voice-card">
-          <div class="voice-row">
-            <div>
-              <div class="voice-title">
-                <span id="voiceIcon">🔊</span>
-                <span>Lectura en Voz Alta</span>
-              </div>
-              <div class="voice-desc" id="voiceStatusDesc">
-                Dirá: <em>"Has recibido [monto] pesos"</em> al llegar cada pago
-              </div>
+      <!-- Barra de Estado IMAP + Remitente Oficial -->
+      <section class="status-strip">
+        <div class="status-left">
+          <span id="watcherDot" class="status-dot unconfigured"></span>
+          <div>
+            <strong id="watcherText">Cargando estado del correo...</strong>
+            <div id="lastCheckText" style="font-size: 0.77rem; color: #64748b;"></div>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <span id="officialSenderBadge" class="sender-pill test-mode" title="Haz clic para cambiar remitente oficial">
+            Remitente oficial: jhocamza@gmail.com
+          </span>
+          <button class="btn btn-outline btn-sm" id="btnCheckNow">
+            🔄 Revisar Ahora
+          </button>
+        </div>
+      </section>
+
+      <!-- Sección Principal: Último Pago + Control de Voz y Total -->
+      <section class="hero-grid">
+        <!-- Tarjeta de Último Pago Verificado -->
+        <div id="latestCard" class="latest-card">
+          <div class="latest-header">
+            <span id="latestBadge" class="verified-badge">⏳ Esperando pagos verificados</span>
+            <span id="latestTimeAgo" class="latest-time-ago"></span>
+          </div>
+
+          <div id="latestContent">
+            <div class="latest-empty">
+              Aún no hay pagos en este periodo. Envía un correo desde el remitente autorizado o usa <strong>⚡ Simular Pago</strong> para probar.
             </div>
-            <label class="switch" title="Habilitar o deshabilitar lectura en voz alta">
-              <input type="checkbox" id="toggleVoice" checked />
-              <span class="slider"></span>
-            </label>
           </div>
-          <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-outline btn-sm" id="btnTestVoice">
-              🔊 Probar lectura de voz
+
+          <div id="latestMeta" class="latest-meta hidden"></div>
+        </div>
+
+        <!-- Columna derecha: Lectura en Voz Alta + Suma rápida y PDF -->
+        <div class="side-stack">
+          <div class="voice-card">
+            <div class="voice-row">
+              <div>
+                <div class="voice-title">
+                  <span id="voiceIcon">🔊</span>
+                  <span>Lectura en Voz Alta</span>
+                </div>
+                <div class="voice-desc" id="voiceStatusDesc">
+                  Dirá: <em>"Has recibido [monto] pesos"</em> al llegar cada pago
+                </div>
+              </div>
+              <label class="switch" title="Habilitar o deshabilitar lectura en voz alta">
+                <input type="checkbox" id="toggleVoice" checked />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
+              <button class="btn btn-outline btn-sm" id="btnTestVoice">
+                🔊 Probar lectura de voz
+              </button>
+            </div>
+          </div>
+
+          <div class="total-card">
+            <div class="total-label" id="summaryPeriodLabel">TOTAL RECIBIDO (HOY)</div>
+            <div class="total-amount" id="heroTotalAmount">$ 0</div>
+            <div class="total-footer">
+              <span style="font-size: 0.86rem; color: #e2e8f0;">
+                <strong id="heroCount">0</strong> pagos verificados
+              </span>
+              <button class="btn btn-yellow btn-sm" id="btnDownloadPdfTop">
+                📄 Descargar Reporte PDF
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tabla Detallada de Pagos y Cruce de Cuentas -->
+      <section class="section-card">
+        <div class="filters-bar">
+          <div class="period-tabs" id="periodTabs">
+            <button class="tab-btn active" data-period="today">Hoy</button>
+            <button class="tab-btn" data-period="yesterday">Ayer</button>
+            <button class="tab-btn" data-period="7days">Últimos 7 días</button>
+            <button class="tab-btn" data-period="month">Este mes</button>
+            <button class="tab-btn" data-period="custom">Por fechas</button>
+            <button class="tab-btn" data-period="all">Todos</button>
+          </div>
+
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-green btn-sm" id="btnDownloadPdfBottom">
+              📄 Descargar PDF Detallado
             </button>
           </div>
         </div>
 
-        <div class="total-card">
-          <div class="total-label" id="summaryPeriodLabel">TOTAL RECIBIDO (HOY)</div>
-          <div class="total-amount" id="heroTotalAmount">$ 0</div>
-          <div class="total-footer">
-            <span style="font-size: 0.86rem; color: #e2e8f0;">
-              <strong id="heroCount">0</strong> pagos verificados
-            </span>
-            <button class="btn btn-yellow btn-sm" id="btnDownloadPdfTop">
-              📄 Descargar Reporte PDF
+        <div id="customDateBar" class="custom-dates hidden" style="margin-bottom: 14px;">
+          <label style="font-size: 0.84rem; font-weight: 600;">Desde:</label>
+          <input type="date" id="dateStart" class="input" style="width: auto;" />
+          <label style="font-size: 0.84rem; font-weight: 600;">Hasta:</label>
+          <input type="date" id="dateEnd" class="input" style="width: auto;" />
+          <button class="btn btn-dark btn-sm" id="btnApplyDates">Filtrar</button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha y Hora</th>
+                <th>Detalle / Canal</th>
+                <th>Remitente Verificado</th>
+                <th>Referencia</th>
+                <th style="text-align: right;">Monto</th>
+                <th style="text-align: center;">Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="paymentsTableBody">
+              <tr>
+                <td colspan="6" style="text-align: center; color: #64748b; padding: 24px;">
+                  Cargando pagos...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Barra inferior de Suma Total para Cruce de Cuentas -->
+        <div class="summary-bottom-bar">
+          <div>
+            <div style="font-weight: 800; color: #065f46;">SUMA TOTAL PARA CRUCE DE CUENTAS</div>
+            <div id="bottomCountText" style="font-size: 0.84rem; color: #047857;">0 pagos en la lista</div>
+          </div>
+          <div class="summary-bottom-total" id="bottomTotalAmount">$ 0</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- MODAL: CONFIGURACIÓN DE CORREO Y REMITENTE OFICIAL -->
+    <div id="modalSettings" class="modal-backdrop hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">⚙️ Configurar Correo y Remitente Oficial</div>
+          <button class="close-btn" data-close="modalSettings">&times;</button>
+        </div>
+
+        <form id="settingsForm" autocomplete="off">
+          <div class="form-group">
+            <label class="form-label">Nombre de tu Negocio (aparece en el PDF)</label>
+            <input type="text" id="cfgBusinessName" class="input" placeholder="Ej. Mi Negocio - Control Bancolombia" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Proveedor del correo donde llegan las notificaciones</label>
+            <select id="cfgProvider" class="input">
+              <option value="gmail">Gmail (Recomendado - imap.gmail.com)</option>
+              <option value="hotmail">Hotmail / Outlook / Live (outlook.office365.com)</option>
+              <option value="yahoo">Yahoo Mail</option>
+              <option value="custom">Otro correo empresarial (IMAP personalizado)</option>
+            </select>
+          </div>
+
+          <div id="customImapFields" class="form-group hidden" style="display: grid; grid-template-columns: 2fr 1fr; gap: 10px;">
+            <div>
+              <label class="form-label">Servidor IMAP</label>
+              <input type="text" id="cfgImapHost" class="input" placeholder="imap.tudominio.com" />
+            </div>
+            <div>
+              <label class="form-label">Puerto SSL</label>
+              <input type="number" id="cfgImapPort" class="input" value="993" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Correo electrónico que recibe los avisos</label>
+            <input type="email" id="cfgEmailUser" class="input" placeholder="ejemplo@gmail.com" required />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Contraseña de Aplicación del correo (Cifrada AES-256-GCM)</label>
+            <input
+              type="password"
+              id="cfgEmailPass"
+              class="input"
+              placeholder="••••••••••••••••"
+              autocomplete="new-password"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <div class="form-hint" id="passSavedHint"></div>
+          </div>
+
+          <details class="guide-box">
+            <summary style="cursor: pointer; font-weight: 700; color: #1d4ed8;">
+              ❓ ¿Cómo obtener la Contraseña de Aplicación en Gmail o Hotmail? (Toma 1 minuto)
+            </summary>
+            <div style="margin-top: 8px;">
+              <strong>Para Gmail:</strong>
+              <ol>
+                <li>Entra a tu cuenta de Google en <strong>myaccount.google.com/security</strong> y asegúrate de tener activa la <em>Verificación en 2 pasos</em>.</li>
+                <li>Abre <strong>myaccount.google.com/apppasswords</strong> (Contraseñas de aplicaciones).</li>
+                <li>Escribe el nombre <em>"Pagos Bancolombia"</em> y pulsa <strong>Crear</strong>.</li>
+                <li>Copia las <strong>16 letras</strong> que te entrega Google y pégalas arriba (se cifrarán automáticamente y nunca serán visibles).</li>
+              </ol>
+              <strong style="display:block; margin-top:6px;">Para Hotmail / Outlook:</strong>
+              <ol>
+                <li>En Configuración de Outlook.com &rarr; <em>Correo &rarr; Reenvío e IMAP</em>, activa el acceso IMAP (o en Seguridad de cuenta Microsoft crea una <em>Contraseña de aplicación</em>).</li>
+                <li><em>Consejo práctico:</em> Si Microsoft bloquea contraseñas básicas en tu cuenta personal, activa en Hotmail el reenvío automático de los correos de Bancolombia hacia tu Gmail.</li>
+              </ol>
+            </div>
+          </details>
+
+          <div class="form-group">
+            <label class="form-label">Correo(s) Remitente(s) Oficial(es) Autorizado(s)</label>
+            <input type="text" id="cfgOfficialSenders" class="input" placeholder="jhocamza@gmail.com" required />
+            <div class="form-hint">
+              Solo los correos enviados exactamente desde estas direcciones serán tomados como pagos válidos (evita comprobantes falsos). Separa varios con coma.
+            </div>
+            <div class="preset-chips">
+              <button type="button" class="btn btn-outline btn-sm" id="btnPresetTest">
+                🧪 Modo Prueba (jhocamza@gmail.com)
+              </button>
+              <button type="button" class="btn btn-outline btn-sm" id="btnPresetBank">
+                🏦 Oficial Bancolombia
+              </button>
+              <button type="button" class="btn btn-outline btn-sm" id="btnPresetBoth">
+                ➕ Ambos (Prueba + Bancolombia)
+              </button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Al iniciar el programa, revisar correos:</label>
+            <select id="cfgLookback" class="input">
+              <option value="today">Recibidos el día de hoy y nuevos en vivo (Recomendado)</option>
+              <option value="now">Únicamente correos nuevos que lleguen desde este instante</option>
+              <option value="7days">De los últimos 7 días</option>
+            </select>
+          </div>
+
+          <div id="settingsFeedback" class="alert-msg hidden"></div>
+
+          <div style="display: flex; justify-content: space-between; gap: 10px; margin-top: 18px; flex-wrap: wrap;">
+            <button type="button" class="btn btn-outline" id="btnTestImap">
+              🔌 Probar Conexión
+            </button>
+            <button type="submit" class="btn btn-green">
+              💾 Guardar y Cifrar
             </button>
           </div>
-        </div>
+        </form>
       </div>
-    </section>
+    </div>
 
-    <!-- Tabla Detallada de Pagos y Cruce de Cuentas -->
-    <section class="section-card">
-      <div class="filters-bar">
-        <div class="period-tabs" id="periodTabs">
-          <button class="tab-btn active" data-period="today">Hoy</button>
-          <button class="tab-btn" data-period="yesterday">Ayer</button>
-          <button class="tab-btn" data-period="7days">Últimos 7 días</button>
-          <button class="tab-btn" data-period="month">Este mes</button>
-          <button class="tab-btn" data-period="custom">Por fechas</button>
-          <button class="tab-btn" data-period="all">Todos</button>
+    <!-- MODAL: CONECTAR 2 O 3 TELÉFONOS POR QR -->
+    <div id="modalPhones" class="modal-backdrop hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">📱 Conectar 2 o 3 Teléfonos en Tiempo Real</div>
+          <button class="close-btn" data-close="modalPhones">&times;</button>
         </div>
 
-        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="btn btn-green btn-sm" id="btnDownloadPdfBottom">
-            📄 Descargar PDF Detallado
+        <p id="phonesModalSubtitle" style="font-size: 0.9rem; color: #334155; margin-bottom: 12px;">
+          Escanea este código QR con la cámara de tus <strong>2 o 3 teléfonos</strong> e inicia sesión con tu cuenta de administrador para recibir las alertas y la voz al instante:
+        </p>
+
+        <div id="networkSelectWrap" class="form-group hidden">
+          <label class="form-label">Adaptador de red Wi-Fi / LAN:</label>
+          <select id="networkIpSelect" class="input"></select>
+        </div>
+
+        <div class="qr-container">
+          <img id="qrImage" src="" alt="Código QR para teléfonos" />
+          <div style="margin-top: 10px; font-weight: 800; font-size: 1.05rem; color: #0f172a;" id="lanUrlText">
+            Cargando enlace...
+          </div>
+          <button type="button" class="btn btn-outline btn-sm" id="btnCopyUrl" style="margin-top: 8px;">
+            📋 Copiar enlace
           </button>
         </div>
-      </div>
 
-      <div id="customDateBar" class="custom-dates hidden" style="margin-bottom: 14px;">
-        <label style="font-size: 0.84rem; font-weight: 600;">Desde:</label>
-        <input type="date" id="dateStart" class="input" style="width: auto;" />
-        <label style="font-size: 0.84rem; font-weight: 600;">Hasta:</label>
-        <input type="date" id="dateEnd" class="input" style="width: auto;" />
-        <button class="btn btn-dark btn-sm" id="btnApplyDates">Filtrar</button>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Fecha y Hora</th>
-              <th>Detalle / Canal</th>
-              <th>Remitente Verificado</th>
-              <th>Referencia</th>
-              <th style="text-align: right;">Monto</th>
-              <th style="text-align: center;">Acciones</th>
-            </tr>
-          </thead>
-          <tbody id="paymentsTableBody">
-            <tr>
-              <td colspan="6" style="text-align: center; color: #64748b; padding: 24px;">
-                Cargando pagos...
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Barra inferior de Suma Total para Cruce de Cuentas -->
-      <div class="summary-bottom-bar">
         <div>
-          <div style="font-weight: 800; color: #065f46;">SUMA TOTAL PARA CRUCE DE CUENTAS</div>
-          <div id="bottomCountText" style="font-size: 0.84rem; color: #047857;">0 pagos en la lista</div>
-        </div>
-        <div class="summary-bottom-total" id="bottomTotalAmount">$ 0</div>
-      </div>
-    </section>
-  </main>
-
-  <!-- MODAL: CONFIGURACIÓN DE CORREO Y REMITENTE OFICIAL -->
-  <div id="modalSettings" class="modal-backdrop hidden">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">⚙️ Configurar Correo y Remitente Oficial</div>
-        <button class="close-btn" data-close="modalSettings">&times;</button>
-      </div>
-
-      <form id="settingsForm">
-        <div class="form-group">
-          <label class="form-label">Nombre de tu Negocio (aparece en el PDF)</label>
-          <input type="text" id="cfgBusinessName" class="input" placeholder="Ej. Mi Negocio - Control Bancolombia" />
+          <div class="form-label">Pantallas autenticadas en este momento:</div>
+          <div id="connectedDevicesList" class="device-list"></div>
         </div>
 
-        <div class="form-group">
-          <label class="form-label">Proveedor del correo donde llegan las notificaciones</label>
-          <select id="cfgProvider" class="input">
-            <option value="gmail">Gmail (Recomendado - imap.gmail.com)</option>
-            <option value="hotmail">Hotmail / Outlook / Live (outlook.office365.com)</option>
-            <option value="yahoo">Yahoo Mail</option>
-            <option value="custom">Otro correo empresarial (IMAP personalizado)</option>
-          </select>
+        <div id="localFirewallHint" class="form-hint" style="margin-top: 12px;">
+          🔒 Cada teléfono debe iniciar sesión una vez con tus credenciales de administrador para autorizar la conexión en vivo.
         </div>
-
-        <div id="customImapFields" class="form-group hidden" style="display: grid; grid-template-columns: 2fr 1fr; gap: 10px;">
-          <div>
-            <label class="form-label">Servidor IMAP</label>
-            <input type="text" id="cfgImapHost" class="input" placeholder="imap.tudominio.com" />
-          </div>
-          <div>
-            <label class="form-label">Puerto SSL</label>
-            <input type="number" id="cfgImapPort" class="input" value="993" />
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Correo electrónico que recibe los avisos</label>
-          <input type="email" id="cfgEmailUser" class="input" placeholder="ejemplo@gmail.com" required />
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Contraseña de Aplicación del correo</label>
-          <input type="password" id="cfgEmailPass" class="input" placeholder="Ingresa la contraseña de aplicación (16 letras en Gmail)" />
-          <div class="form-hint" id="passSavedHint"></div>
-        </div>
-
-        <details class="guide-box">
-          <summary style="cursor: pointer; font-weight: 700; color: #1d4ed8;">
-            ❓ ¿Cómo obtener la Contraseña de Aplicación en Gmail o Hotmail? (Toma 1 minuto)
-          </summary>
-          <div style="margin-top: 8px;">
-            <strong>Para Gmail:</strong>
-            <ol>
-              <li>Entra a tu cuenta de Google en <strong>myaccount.google.com/security</strong> y asegúrate de tener activa la <em>Verificación en 2 pasos</em>.</li>
-              <li>Abre <strong>myaccount.google.com/apppasswords</strong> (Contraseñas de aplicaciones).</li>
-              <li>Escribe el nombre <em>"Pagos Bancolombia"</em> y pulsa <strong>Crear</strong>.</li>
-              <li>Copia las <strong>16 letras</strong> que te entrega Google y pégalas arriba.</li>
-            </ol>
-            <strong style="display:block; margin-top:6px;">Para Hotmail / Outlook:</strong>
-            <ol>
-              <li>En Configuración de Outlook.com &rarr; <em>Correo &rarr; Reenvío e IMAP</em>, activa el acceso IMAP (o en Seguridad de cuenta Microsoft crea una <em>Contraseña de aplicación</em>).</li>
-              <li><em>Consejo práctico:</em> Si Microsoft bloquea contraseñas básicas en tu cuenta personal, activa en Hotmail el reenvío automático de los correos de Bancolombia hacia tu Gmail.</li>
-            </ol>
-          </div>
-        </details>
-
-        <div class="form-group">
-          <label class="form-label">Correo(s) Remitente(s) Oficial(es) Autorizado(s)</label>
-          <input type="text" id="cfgOfficialSenders" class="input" placeholder="jhocamza@gmail.com" required />
-          <div class="form-hint">
-            Solo los correos enviados exactamente desde estas direcciones serán tomados como pagos válidos (evita comprobantes falsos). Separa varios con coma.
-          </div>
-          <div class="preset-chips">
-            <button type="button" class="btn btn-outline btn-sm" id="btnPresetTest">
-              🧪 Modo Prueba (jhocamza@gmail.com)
-            </button>
-            <button type="button" class="btn btn-outline btn-sm" id="btnPresetBank">
-              🏦 Oficial Bancolombia
-            </button>
-            <button type="button" class="btn btn-outline btn-sm" id="btnPresetBoth">
-              ➕ Ambos (Prueba + Bancolombia)
-            </button>
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Al iniciar el programa, revisar correos:</label>
-          <select id="cfgLookback" class="input">
-            <option value="today">Recibidos el día de hoy y nuevos en vivo (Recomendado)</option>
-            <option value="now">Únicamente correos nuevos que lleguen desde este instante</option>
-            <option value="7days">De los últimos 7 días</option>
-          </select>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">PIN de seguridad opcional para teléfonos (dejar vacío para acceso directo)</label>
-          <input type="text" id="cfgPin" class="input" placeholder="Sin PIN (opcional, ej: 1234)" />
-        </div>
-
-        <div id="settingsFeedback" class="alert-msg hidden"></div>
-
-        <div style="display: flex; justify-content: space-between; gap: 10px; margin-top: 18px; flex-wrap: wrap;">
-          <button type="button" class="btn btn-outline" id="btnTestImap">
-            🔌 Probar Conexión
-          </button>
-          <button type="submit" class="btn btn-green">
-            💾 Guardar y Conectar
-          </button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <!-- MODAL: CONECTAR 2 O 3 TELÉFONOS POR QR -->
-  <div id="modalPhones" class="modal-backdrop hidden">
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">📱 Conectar 2 o 3 Teléfonos en Tiempo Real</div>
-        <button class="close-btn" data-close="modalPhones">&times;</button>
-      </div>
-
-      <p id="phonesModalSubtitle" style="font-size: 0.9rem; color: #334155; margin-bottom: 12px;">
-        Escanea este código QR con la cámara de tus <strong>2 o 3 teléfonos</strong> para recibir las alertas y la lectura en voz alta al instante (no requiere instalar nada):
-      </p>
-
-      <div id="networkSelectWrap" class="form-group hidden">
-        <label class="form-label">Adaptador de red Wi-Fi / LAN:</label>
-        <select id="networkIpSelect" class="input"></select>
-      </div>
-
-      <div class="qr-container">
-        <img id="qrImage" src="" alt="Código QR para teléfonos" />
-        <div style="margin-top: 10px; font-weight: 800; font-size: 1.05rem; color: #0f172a;" id="lanUrlText">
-          http://localhost:3000
-        </div>
-        <button type="button" class="btn btn-outline btn-sm" id="btnCopyUrl" style="margin-top: 8px;">
-          📋 Copiar enlace
-        </button>
-      </div>
-
-      <div>
-        <div class="form-label">Pantallas conectadas en este momento:</div>
-        <div id="connectedDevicesList" class="device-list"></div>
-      </div>
-
-      <div id="localFirewallHint" class="form-hint" style="margin-top: 12px;">
-        💡 En Render/Internet puedes conectar celulares incluso con datos móviles. En modo local (PC), asegúrate de estar en la misma red Wi-Fi.
       </div>
     </div>
-  </div>
 
-  <!-- MODAL: SIMULAR PAGO DE PRUEBA -->
-  <div id="modalSimulate" class="modal-backdrop hidden">
-    <div class="modal" style="max-width: 460px;">
-      <div class="modal-header">
-        <div class="modal-title">⚡ Simular Pago Recibido</div>
-        <button class="close-btn" data-close="modalSimulate">&times;</button>
+    <!-- MODAL: SIMULAR PAGO DE PRUEBA -->
+    <div id="modalSimulate" class="modal-backdrop hidden">
+      <div class="modal" style="max-width: 460px;">
+        <div class="modal-header">
+          <div class="modal-title">⚡ Simular Pago Recibido</div>
+          <button class="close-btn" data-close="modalSimulate">&times;</button>
+        </div>
+
+        <p style="font-size: 0.86rem; color: #475569; margin-bottom: 14px;">
+          Genera un pago de prueba para escuchar la voz <em>"Has recibido..."</em>, ver la alerta simultánea en tus teléfonos conectados y probar el reporte PDF.
+        </p>
+
+        <form id="simulateForm">
+          <div class="form-group">
+            <label class="form-label">Monto en Pesos Colombianos (COP)</label>
+            <input type="number" id="simAmount" class="input" value="50000" min="100" step="100" required />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Canal</label>
+            <select id="simChannel" class="input">
+              <option value="Transferencia Bancolombia">Transferencia Bancolombia</option>
+              <option value="Código QR Bancolombia">Código QR Bancolombia</option>
+              <option value="Nequi a Bancolombia">Nequi a Bancolombia</option>
+              <option value="Bre-B / Llave">Bre-B / Llave</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Nombre del cliente / pagador</label>
+            <input type="text" id="simPayer" class="input" value="CARLOS GOMEZ (PRUEBA)" />
+          </div>
+
+          <div style="display: flex; justify-content: space-between; gap: 8px; margin-top: 16px; flex-wrap: wrap;">
+            <button type="button" class="btn btn-danger-ghost" id="btnClearSimulated">
+              🗑️ Borrar todos los de prueba
+            </button>
+            <button type="submit" class="btn btn-green">
+              🔊 Enviar Pago de Prueba
+            </button>
+          </div>
+        </form>
       </div>
-
-      <p style="font-size: 0.86rem; color: #475569; margin-bottom: 14px;">
-        Genera un pago de prueba para escuchar la voz <em>"Has recibido..."</em>, ver la alerta simultánea en tus teléfonos conectados y probar el reporte PDF.
-      </p>
-
-      <form id="simulateForm">
-        <div class="form-group">
-          <label class="form-label">Monto en Pesos Colombianos (COP)</label>
-          <input type="number" id="simAmount" class="input" value="50000" min="100" step="100" required />
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Canal</label>
-          <select id="simChannel" class="input">
-            <option value="Transferencia Bancolombia">Transferencia Bancolombia</option>
-            <option value="Código QR Bancolombia">Código QR Bancolombia</option>
-            <option value="Nequi a Bancolombia">Nequi a Bancolombia</option>
-            <option value="Bre-B / Llave">Bre-B / Llave</option>
-          </select>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Nombre del cliente / pagador</label>
-          <input type="text" id="simPayer" class="input" value="CARLOS GOMEZ (PRUEBA)" />
-        </div>
-
-        <div style="display: flex; justify-content: space-between; gap: 8px; margin-top: 16px; flex-wrap: wrap;">
-          <button type="button" class="btn btn-danger-ghost" id="btnClearSimulated">
-            🗑️ Borrar todos los de prueba
-          </button>
-          <button type="submit" class="btn btn-green">
-            🔊 Enviar Pago de Prueba
-          </button>
-        </div>
-      </form>
     </div>
   </div>
 

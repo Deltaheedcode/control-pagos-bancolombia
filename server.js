@@ -8,13 +8,13 @@ const QRCode = require('qrcode');
 
 const db = require('./src/db');
 const parser = require('./src/parser');
+const security = require('./src/security');
 const emailWatcher = require('./src/emailWatcher');
 const { generatePaymentsPdfStream } = require('./src/pdfReport');
 
 const PORT = Number(process.env.PORT) || 3000;
 
 function getColombiaDateParts(date = new Date()) {
-  // Colombia siempre es UTC-5 sin horario de verano
   const bogotaMs = date.getTime() - 5 * 60 * 60 * 1000;
   const bogota = new Date(bogotaMs);
   const yyyy = bogota.getUTCFullYear();
@@ -122,15 +122,60 @@ function getLocalLanAddresses(port) {
   return candidates;
 }
 
-function createAppServer({ autoStartWatcher = true } = {}) {
+function extractClientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+
+function isSecureRequest(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || '').toLowerCase();
+  return proto.includes('https');
+}
+
+function buildSessionCookieHeader(token, maxAgeSeconds, secureFlag) {
+  const parts = [
+    `${security.SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'HttpOnly',
+    'Path=/',
+    `Max-Age=${maxAgeSeconds}`,
+    'SameSite=Lax'
+  ];
+  if (secureFlag) {
+    parts.push('Secure');
+  }
+  return parts.join('; ');
+}
+
+function createAppServer({
+  autoStartWatcher = true,
+  authConfig = security.DEFAULT_ADMIN_AUTH
+} = {}) {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  const loginLimiter = new security.LoginRateLimiter({
+    maxAttempts: 5,
+    windowMs: 15 * 60 * 1000
+  });
+
+  // Cabeceras de seguridad endurecidas
+  app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '256kb' }));
   app.use(express.static(path.join(__dirname, 'public')));
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 
-  // Registro de pantallas/teléfonos conectados
   const connectedClients = new Map();
 
   function getDevicesList() {
@@ -156,38 +201,106 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     }
   }
 
-  // Middleware de PIN opcional para proteger el acceso en Wi-Fi abiertas
-  function checkPinMiddleware(req, res, next) {
-    const settings = db.getAllSettings(true);
-    const requiredPin = (settings.access_pin || '').trim();
-    if (!requiredPin) return next();
-
-    const provided = String(req.headers['x-access-pin'] || req.query.pin || '').trim();
-    if (provided === requiredPin) return next();
-
-    return res.status(401).json({
-      ok: false,
-      pinRequired: true,
-      error: 'Se requiere el PIN de acceso configurado.'
-    });
+  function getVerifiedSessionFromReq(req) {
+    const cookies = security.parseCookies(req.headers.cookie);
+    const token = cookies[security.SESSION_COOKIE_NAME];
+    if (!token) return null;
+    const payload = security.verifySessionToken(token);
+    if (!payload) return null;
+    return { token, payload };
   }
 
+  function requireAuth(req, res, next) {
+    const session = getVerifiedSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({
+        ok: false,
+        authRequired: true,
+        error: 'Acceso restringido. Debes iniciar sesión.'
+      });
+    }
+    req.adminSession = session;
+    return next();
+  }
+
+  // Healthcheck para Render (no expone ningún dato privado)
   app.get('/api/health', (req, res) => {
-    res.json({ ok: true, status: 'healthy', timestamp: new Date().toISOString() });
+    res.json({ ok: true, status: 'healthy' });
   });
 
-  app.get('/api/ping-auth', (req, res) => {
-    const settings = db.getAllSettings(true);
-    const requiredPin = (settings.access_pin || '').trim();
-    const provided = String(req.headers['x-access-pin'] || req.query.pin || '').trim();
+  // --- ENDPOINTS DE AUTENTICACIÓN (SIN OPCIÓN DE CAMBIAR CLAVE POR INTERFAZ) ---
+  app.get('/api/auth/session', (req, res) => {
+    const session = getVerifiedSessionFromReq(req);
     res.json({
       ok: true,
-      pinRequired: Boolean(requiredPin),
-      authorized: !requiredPin || provided === requiredPin
+      authenticated: Boolean(session)
     });
   });
 
-  app.get('/api/state', checkPinMiddleware, (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
+    const ip = extractClientIp(req);
+    const rateCheck = loginLimiter.check(ip);
+    if (rateCheck.blocked) {
+      const mins = Math.ceil(rateCheck.retryAfterSeconds / 60);
+      return res.status(429).json({
+        ok: false,
+        error: `Demasiados intentos fallidos. Acceso bloqueado temporalmente por ${mins} minuto(s) por seguridad.`
+      });
+    }
+
+    const { username, password } = req.body || {};
+    const valid = security.verifyAdminCredentials(username, password, authConfig);
+
+    if (!valid) {
+      loginLimiter.recordFailure(ip);
+      // Pequeña pausa adicional contra fuerza bruta automatizada
+      await new Promise((r) => setTimeout(r, 350));
+      return res.status(401).json({
+        ok: false,
+        error: 'Usuario o contraseña incorrectos.'
+      });
+    }
+
+    loginLimiter.reset(ip);
+    const token = security.createSessionToken();
+    const maxAgeSec = Math.floor(security.SESSION_TTL_MS / 1000);
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader(token, maxAgeSec, isSecureRequest(req))
+    );
+
+    return res.json({
+      ok: true,
+      authenticated: true
+    });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const cookies = security.parseCookies(req.headers.cookie);
+    const token = cookies[security.SESSION_COOKIE_NAME];
+    if (token) {
+      security.revokeSessionToken(token);
+      // Cerrar WebSockets asociados a ese token de sesión
+      for (const [id, entry] of connectedClients.entries()) {
+        if (entry.sessionToken === token) {
+          try {
+            entry.ws.close(4001, 'Sesión cerrada');
+          } catch (_) {}
+          connectedClients.delete(id);
+        }
+      }
+      broadcast({ type: 'devices', devices: getDevicesList() });
+    }
+
+    res.setHeader(
+      'Set-Cookie',
+      buildSessionCookieHeader('', 0, isSecureRequest(req))
+    );
+    res.json({ ok: true, authenticated: false });
+  });
+
+  // --- TODOS LOS ENDPOINTS SIGUIENTES EXIGEN SESIÓN VÁLIDA ---
+  app.get('/api/state', requireAuth, (req, res) => {
     res.json({
       ok: true,
       settings: db.getAllSettings(false),
@@ -198,7 +311,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.get('/api/network-info', checkPinMiddleware, async (req, res) => {
+  app.get('/api/network-info', requireAuth, async (req, res) => {
     const actualPort = (server.address() && server.address().port) || PORT;
     const reqHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
     const reqProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
@@ -210,7 +323,6 @@ function createAppServer({ autoStartWatcher = true } = {}) {
       reqHost.startsWith('127.0.0.1') ||
       /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(reqHost);
 
-    // Si corre en Render o dominio público en la nube, el QR apunta directo a la URL pública HTTPS
     const cloudExternalUrl =
       process.env.RENDER_EXTERNAL_URL || (!isLocalHostHeader ? `${reqProto}://${reqHost}` : '');
 
@@ -231,7 +343,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
         qrDataUrl,
         addresses: [
           {
-            interface: 'Nube (Acceso desde cualquier red / datos móviles)',
+            interface: 'Nube segura (Acceso autenticado)',
             ip: cleanUrl,
             url: cleanUrl,
             isVirtual: false
@@ -270,7 +382,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.get('/api/payments', checkPinMiddleware, (req, res) => {
+  app.get('/api/payments', requireAuth, (req, res) => {
     const range = resolvePeriodRange(req.query);
     const data = db.listPayments({
       startIso: range.startIso,
@@ -284,7 +396,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.get('/api/report/pdf', checkPinMiddleware, (req, res) => {
+  app.get('/api/report/pdf', requireAuth, (req, res) => {
     const range = resolvePeriodRange(req.query);
     const data = db.listPayments({
       startIso: range.startIso,
@@ -308,7 +420,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.post('/api/settings', checkPinMiddleware, async (req, res) => {
+  app.post('/api/settings', requireAuth, async (req, res) => {
     const body = req.body || {};
     const prev = db.getAllSettings(true);
 
@@ -322,8 +434,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
       imap_tls: body.imap_tls,
       official_senders: body.official_senders,
       sync_lookback: body.sync_lookback,
-      voice_enabled_default: body.voice_enabled_default,
-      access_pin: body.access_pin
+      voice_enabled_default: body.voice_enabled_default
     });
 
     const after = db.getAllSettings(true);
@@ -356,12 +467,12 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.post('/api/email/test-connection', checkPinMiddleware, async (req, res) => {
+  app.post('/api/email/test-connection', requireAuth, async (req, res) => {
     const result = await emailWatcher.testConnection(req.body || {});
     res.json(result);
   });
 
-  app.post('/api/email/check-now', checkPinMiddleware, async (req, res) => {
+  app.post('/api/email/check-now', requireAuth, async (req, res) => {
     const result = await emailWatcher.checkNow({ manual: true });
     res.json({
       ok: true,
@@ -370,7 +481,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.post('/api/payments/simulate', checkPinMiddleware, (req, res) => {
+  app.post('/api/payments/simulate', requireAuth, (req, res) => {
     const body = req.body || {};
     const settings = db.getAllSettings(false);
     const officialList = parser.normalizeSenderList(settings.official_senders);
@@ -379,8 +490,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     const channel = body.channel || 'Transferencia Bancolombia';
     const payer = body.payer || 'CLIENTE DE PRUEBA';
 
-    // Pasarlo por el mismo motor analizador para probar toda la cadena real
-    const simulatedSubject = `Bancolombia le informa recepción de pago`;
+    const simulatedSubject = 'Bancolombia le informa recepción de pago';
     const simulatedBody = `Bancolombia: Recibiste una transferencia por $${Number(rawAmount).toLocaleString('es-CO')} de ${payer} mediante ${channel}. Comprobante TEST-${Math.floor(100000 + Math.random() * 900000)}.`;
 
     const analysis = parser.analyzeEmailForPayment({
@@ -415,27 +525,26 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
   });
 
-  app.delete('/api/payments-test', checkPinMiddleware, (req, res) => {
+  app.delete('/api/payments-test', requireAuth, (req, res) => {
     const deletedCount = db.clearTestPayments();
     broadcast({ type: 'payments_changed' });
     res.json({ ok: true, deletedCount });
   });
 
-  app.delete('/api/payments/:id', checkPinMiddleware, (req, res) => {
+  app.delete('/api/payments/:id', requireAuth, (req, res) => {
     const deleted = db.deletePayment(req.params.id);
     broadcast({ type: 'payments_changed' });
     res.json({ ok: true, deleted });
   });
 
-  // Eventos WebSocket para sincronizar PC y 2-3 teléfonos en vivo
+  // WebSocket exige cookie de sesión HttpOnly válida
   wss.on('connection', (ws, req) => {
-    const settings = db.getAllSettings(true);
-    const requiredPin = (settings.access_pin || '').trim();
-    const urlObj = new URL(req.url, 'http://localhost');
-    const providedPin = (urlObj.searchParams.get('pin') || '').trim();
+    const cookies = security.parseCookies(req.headers.cookie);
+    const token = cookies[security.SESSION_COOKIE_NAME];
+    const verified = security.verifySessionToken(token);
 
-    if (requiredPin && providedPin !== requiredPin) {
-      ws.close(4001, 'PIN requerido');
+    if (!verified) {
+      ws.close(4001, 'No autorizado');
       return;
     }
 
@@ -450,6 +559,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
 
     const clientEntry = {
       ws,
+      sessionToken: token,
       isAlive: true,
       name: defaultName,
       deviceType: isMobile ? 'phone' : 'pc',
@@ -465,6 +575,11 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     });
 
     ws.on('message', (raw) => {
+      // Re-verificar que el token no haya expirado ni sido revocado
+      if (!security.verifySessionToken(clientEntry.sessionToken)) {
+        ws.close(4001, 'Sesión expirada');
+        return;
+      }
       try {
         const msg = JSON.parse(String(raw));
         if (msg.type === 'hello' || msg.type === 'update_device') {
@@ -485,7 +600,7 @@ function createAppServer({ autoStartWatcher = true } = {}) {
 
   const wsHeartbeat = setInterval(() => {
     for (const [id, entry] of connectedClients.entries()) {
-      if (!entry.isAlive) {
+      if (!entry.isAlive || !security.verifySessionToken(entry.sessionToken)) {
         entry.ws.terminate();
         connectedClients.delete(id);
         continue;
@@ -501,7 +616,6 @@ function createAppServer({ autoStartWatcher = true } = {}) {
     clearInterval(wsHeartbeat);
   });
 
-  // Conectar eventos de EmailWatcher hacia WebSocket
   emailWatcher.on('payment', ({ payment, announceVoice }) => {
     broadcast({
       type: 'new_payment',
@@ -536,7 +650,7 @@ if (require.main === module) {
   server.listen(PORT, '0.0.0.0', () => {
     const lanList = getLocalLanAddresses(PORT);
     console.log('\n============================================================');
-    console.log('  CONTROL DE PAGOS BANCOLOMBIA - SERVIDOR ACTIVO');
+    console.log('  CONTROL DE PAGOS BANCOLOMBIA - SERVIDOR PROTEGIDO ACTIVO');
     console.log('============================================================');
     console.log(`  En este computador:   http://localhost:${PORT}`);
     if (lanList.length > 0) {

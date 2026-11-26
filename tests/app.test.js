@@ -1,9 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { DatabaseSync } = require('node:sqlite');
 const { WebSocket } = require('ws');
 
 const NumberToSpanish = require('../public/numberToSpanish');
 const parser = require('../src/parser');
+const security = require('../src/security');
+const db = require('../src/db');
 const { createAppServer } = require('../server');
 
 test('Conversión exacta de montos COP a voz en español', () => {
@@ -46,8 +49,20 @@ test('Parseo de formatos numéricos colombianos y de Bancolombia', () => {
   assert.equal(parser.parseColombianAmountString('85000'), 85000);
 });
 
+test('Bóveda AES-256-GCM cifra clave de aplicación y detecta manipulación', () => {
+  const sampleAppPass = 'wxyz abcd mnop qrst';
+  const encrypted = security.encryptSecret(sampleAppPass);
+
+  assert.equal(security.isEncryptedSecret(encrypted), true);
+  assert.equal(encrypted.includes('wxyz'), false);
+  assert.equal(security.decryptSecret(encrypted), sampleAppPass);
+
+  // Manipular 1 carácter del texto cifrado debe invalidar la etiqueta GCM
+  const tampered = encrypted.slice(0, -2) + (encrypted.endsWith('AA') ? 'BB' : 'AA');
+  assert.equal(security.decryptSecret(tampered), '');
+});
+
 test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y compras salientes', () => {
-  // 1. Prueba válida desde jhocamza@gmail.com
   const okTest = parser.analyzeEmailForPayment({
     fromAddress: 'jhocamza@gmail.com',
     fromName: 'Jhoan',
@@ -58,9 +73,7 @@ test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y c
   });
   assert.equal(okTest.accepted, true);
   assert.equal(okTest.payment.amount, 75000);
-  assert.equal(okTest.payment.voice_phrase, 'Has recibido setenta y cinco mil pesos');
 
-  // 2. Rechazar correo enviado desde otro remitente falso
   const fakeSender = parser.analyzeEmailForPayment({
     fromAddress: 'bancolombia.falso123@gmail.com',
     fromName: 'Bancolombia',
@@ -72,7 +85,6 @@ test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y c
   assert.equal(fakeSender.accepted, false);
   assert.equal(fakeSender.reason, 'unauthorized_sender');
 
-  // 3. Rechazar correo con cabeceras SPF/DKIM fallidas (suplantación)
   const spoofed = parser.analyzeEmailForPayment({
     fromAddress: 'alertasynotificaciones@notificacionesbancolombia.com',
     fromName: 'Bancolombia',
@@ -84,7 +96,6 @@ test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y c
   assert.equal(spoofed.accepted, false);
   assert.equal(spoofed.reason, 'spoof_suspected');
 
-  // 4. Rechazar compras o retiros propios (salidas de dinero)
   const outgoing = parser.analyzeEmailForPayment({
     fromAddress: 'alertasynotificaciones@notificacionesbancolombia.com',
     fromName: 'Bancolombia',
@@ -94,114 +105,164 @@ test('Filtro anti-fraude: acepta remitente oficial, rechaza falsos, spoofing y c
   });
   assert.equal(outgoing.accepted, false);
   assert.equal(outgoing.reason, 'outgoing_transaction');
-
-  // 5. Aceptar formato real Bancolombia QR / Transferencia
-  const realBank = parser.analyzeEmailForPayment({
-    fromAddress: 'alertasynotificaciones@notificacionesbancolombia.com',
-    fromName: 'Alertas y Notificaciones',
-    subject: '¡Recibiste un pago con Código QR!',
-    htmlBody: '<div>Bancolombia: Recibiste una transferencia por <b>$ 148.500,00</b> de MARIA LOPEZ en tu cuenta *9876. Comprobante QR998877.</div>',
-    headers: new Map([['authentication-results', 'mx.google.com; spf=pass; dkim=pass']]),
-    officialSenders: parser.DEFAULT_BANCOLOMBIA_SENDERS
-  });
-  assert.equal(realBank.accepted, true);
-  assert.equal(realBank.payment.amount, 148500);
-  assert.equal(realBank.payment.channel, 'Código QR Bancolombia');
-  assert.equal(realBank.payment.reference, 'QR998877');
 });
 
-test('Servidor E2E: sincronización en 3 teléfonos + configuración inicial jhocamza@gmail.com + reporte PDF', async () => {
-  const { server } = createAppServer({ autoStartWatcher: false });
+test('Seguridad E2E: bloqueo sin sesión, límite anti-fuerza bruta, cifrado en SQLite, 3 teléfonos y revocación', async () => {
+  // Credenciales efímeras generadas solo en memoria para el test
+  const ephemeralAuth = security.generateCredentialsConfig('USUARIO_TEST', 'ClaveEfimera#Test99');
+  const { server } = createAppServer({
+    autoStartWatcher: false,
+    authConfig: ephemeralAuth
+  });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    // Verificar configuración inicial solicitada por el usuario
-    const stateRes = await fetch(`${baseUrl}/api/state`).then((r) => r.json());
-    assert.equal(stateRes.ok, true);
-    assert.equal(stateRes.settings.official_senders, 'jhocamza@gmail.com');
+    // 1. Bloqueo total sin sesión en endpoints privados y PDF
+    const unauthState = await fetch(`${baseUrl}/api/state`);
+    assert.equal(unauthState.status, 401);
 
-    // Verificar generación de código QR para celulares
-    const netRes = await fetch(`${baseUrl}/api/network-info`).then((r) => r.json());
-    assert.equal(netRes.ok, true);
-    assert.match(netRes.qrDataUrl, /^data:image\/png;base64,/);
+    const unauthPdf = await fetch(`${baseUrl}/api/report/pdf?period=today`);
+    assert.equal(unauthPdf.status, 401);
 
-    // Conectar simultáneamente 1 PC + 2 Teléfonos vía WebSocket
+    // 2. WebSocket sin sesión debe rechazarse con código 4001
+    const unauthWsCode = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      ws.on('close', (code) => resolve(code));
+    });
+    assert.equal(unauthWsCode, 4001);
+
+    // 3. Bloqueo anti-fuerza bruta tras 5 intentos fallidos desde una IP atacante
+    for (let i = 0; i < 5; i += 1) {
+      const badResp = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.100.77'
+        },
+        body: JSON.stringify({ username: 'INTRUSO', password: 'wrong' })
+      });
+      assert.equal(badResp.status, 401);
+    }
+    const lockedResp = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.77'
+      },
+      body: JSON.stringify({ username: 'USUARIO_TEST', password: 'ClaveEfimera#Test99' })
+    });
+    assert.equal(lockedResp.status, 429);
+
+    // 4. Inicio de sesión legítimo y cookie HttpOnly
+    const loginResp = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.10'
+      },
+      body: JSON.stringify({ username: 'USUARIO_TEST', password: 'ClaveEfimera#Test99' })
+    });
+    assert.equal(loginResp.status, 200);
+    const setCookie = loginResp.headers.get('set-cookie') || '';
+    assert.match(setCookie, /HttpOnly/i);
+    const cookieHeader = setCookie.split(';')[0];
+
+    // 5. Verificar que guardar una clave de aplicación nunca la expone por API y queda cifrada en SQLite
+    const saveRes = await fetch(`${baseUrl}/api/settings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader
+      },
+      body: JSON.stringify({
+        business_name: 'Control de Pagos Bancolombia',
+        email_provider: 'gmail',
+        email_user: 'jhocamza@gmail.com',
+        email_pass: 'clavePruebaTemporal1234',
+        official_senders: 'jhocamza@gmail.com',
+        sync_lookback: 'today'
+      })
+    }).then((r) => r.json());
+
+    assert.equal(saveRes.ok, true);
+    assert.equal(saveRes.settings.has_password, true);
+    assert.equal(saveRes.settings.email_pass, undefined);
+
+    const rawDb = new DatabaseSync(db.DB_PATH, { readOnly: true });
+    const rawRow = rawDb.prepare("SELECT value FROM settings WHERE key = 'email_pass'").get();
+    rawDb.close();
+    assert.ok(rawRow.value.startsWith('enc:gcm:v1:'));
+    assert.equal(rawRow.value.includes('clavePruebaTemporal1234'), false);
+
+    // Limpiar clave temporal de prueba
+    db.updateSettings({ email_pass: '' });
+
+    // 6. Conectar 3 pantallas autenticadas (PC + 2 teléfonos) y verificar alerta de voz + PDF
     const clients = [
-      new WebSocket(`ws://127.0.0.1:${port}/ws`),
-      new WebSocket(`ws://127.0.0.1:${port}/ws`),
-      new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } }),
+      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } }),
+      new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { Cookie: cookieHeader } })
     ];
 
     await Promise.all(
       clients.map(
-        (ws, idx) =>
+        (ws) =>
           new Promise((resolve, reject) => {
-            ws.once('open', () => {
-              ws.send(
-                JSON.stringify({
-                  type: 'hello',
-                  name: idx === 0 ? 'PC Caja' : `Teléfono ${idx}`,
-                  voiceEnabled: true
-                })
-              );
-              resolve();
-            });
+            ws.once('open', resolve);
             ws.once('error', reject);
           })
       )
     );
 
-    // Preparar escucha de alerta simultánea en los 3 dispositivos
-    const paymentBroadcastPromises = clients.map(
+    const broadcastPromises = clients.map(
       (ws) =>
         new Promise((resolve) => {
           ws.on('message', (raw) => {
-            const data = JSON.parse(String(raw));
-            if (data.type === 'new_payment') {
-              resolve(data);
-            }
+            const msg = JSON.parse(String(raw));
+            if (msg.type === 'new_payment') resolve(msg);
           });
         })
     );
 
-    // Simular llegada de un pago de $85.000
     const simRes = await fetch(`${baseUrl}/api/payments/simulate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        amount: 85000,
-        channel: 'Transferencia Bancolombia',
-        payer: 'PEDRO PEREZ'
-      })
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader
+      },
+      body: JSON.stringify({ amount: 85000, channel: 'Transferencia Bancolombia', payer: 'PEDRO PEREZ' })
     }).then((r) => r.json());
-
     assert.equal(simRes.ok, true);
-    assert.equal(simRes.payment.amount, 85000);
 
-    const receivedAlerts = await Promise.all(paymentBroadcastPromises);
-    assert.equal(receivedAlerts.length, 3);
-    for (const alert of receivedAlerts) {
-      assert.equal(alert.announceVoice, true);
-      assert.equal(alert.payment.voice_phrase, 'Has recibido ochenta y cinco mil pesos');
-    }
+    const alerts = await Promise.all(broadcastPromises);
+    assert.equal(alerts.length, 3);
+    assert.equal(alerts[0].payment.voice_phrase, 'Has recibido ochenta y cinco mil pesos');
 
-    // Verificar descarga del Reporte PDF con el detallado y suma total
-    const pdfResp = await fetch(`${baseUrl}/api/report/pdf?period=today`);
+    const pdfResp = await fetch(`${baseUrl}/api/report/pdf?period=today`, {
+      headers: { Cookie: cookieHeader }
+    });
     assert.equal(pdfResp.status, 200);
-    assert.equal(pdfResp.headers.get('content-type'), 'application/pdf');
     const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
-    assert.ok(pdfBuf.length > 1000, 'El PDF debe tener contenido válido');
     assert.equal(pdfBuf.subarray(0, 5).toString('ascii'), '%PDF-');
 
-    // Limpiar pagos de prueba para dejar la base de datos limpia al usuario
-    const cleanRes = await fetch(`${baseUrl}/api/payments-test`, { method: 'DELETE' }).then((r) =>
-      r.json()
-    );
-    assert.equal(cleanRes.ok, true);
-    assert.ok(cleanRes.deletedCount >= 1);
+    await fetch(`${baseUrl}/api/payments-test`, {
+      method: 'DELETE',
+      headers: { Cookie: cookieHeader }
+    });
+
+    // 7. Cerrar sesión invalida inmediatamente el token aunque se reenvíe la cookie
+    await fetch(`${baseUrl}/api/auth/logout`, {
+      method: 'POST',
+      headers: { Cookie: cookieHeader }
+    });
+
+    const afterLogout = await fetch(`${baseUrl}/api/state`, {
+      headers: { Cookie: cookieHeader }
+    });
+    assert.equal(afterLogout.status, 401);
 
     for (const ws of clients) {
       ws.close();

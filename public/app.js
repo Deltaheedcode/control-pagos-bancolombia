@@ -4,6 +4,7 @@
   const TEST_SENDER_EMAIL = 'jhocamza@gmail.com';
 
   const state = {
+    authenticated: false,
     period: 'today',
     customStart: '',
     customEnd: '',
@@ -13,9 +14,9 @@
     watcherStatus: {},
     devices: [],
     voiceEnabled: localStorage.getItem('bancolombia_voice_enabled') !== 'false',
-    accessPin: localStorage.getItem('bancolombia_access_pin') || '',
     audioUnlocked: false,
-    ws: null
+    ws: null,
+    wsReconnectTimer: null
   };
 
   let audioCtx = null;
@@ -31,13 +32,13 @@
         audioCtx.resume();
       }
       if ('speechSynthesis' in window) {
-        // Desbloqueo silencioso para iOS Safari / Android Chrome
         const warm = new SpeechSynthesisUtterance('');
         warm.volume = 0;
         window.speechSynthesis.speak(warm);
       }
       state.audioUnlocked = true;
-      document.getElementById('audioUnlockBanner').classList.add('hidden');
+      const banner = document.getElementById('audioUnlockBanner');
+      if (banner) banner.classList.add('hidden');
     } catch (_) {}
   }
 
@@ -49,7 +50,6 @@
       if (audioCtx.state === 'suspended') audioCtx.resume();
 
       const now = audioCtx.currentTime;
-      // Dos notas claras tipo caja/notificación bancaria (Mi6 -> Si6)
       const freqs = [1318.5, 1975.5];
       freqs.forEach((f, idx) => {
         const osc = audioCtx.createOscillator();
@@ -82,7 +82,6 @@
     if (!state.voiceEnabled && !forceEvenIfDisabled) return;
 
     playCashChime();
-
     if (!('speechSynthesis' in window)) return;
 
     setTimeout(() => {
@@ -99,28 +98,54 @@
     }, 340);
   }
 
+  // --- GESTIÓN DE VISTAS LOGIN VS DASHBOARD ---
+  function showLoginScreen() {
+    state.authenticated = false;
+    if (state.wsReconnectTimer) {
+      clearTimeout(state.wsReconnectTimer);
+      state.wsReconnectTimer = null;
+    }
+    if (state.ws) {
+      try {
+        state.ws.close();
+      } catch (_) {}
+      state.ws = null;
+    }
+    document.getElementById('appRoot').classList.add('hidden');
+    document.getElementById('loginScreen').classList.remove('hidden');
+    document.getElementById('loginPass').value = '';
+  }
+
+  async function showAuthenticatedApp() {
+    state.authenticated = true;
+    document.getElementById('loginScreen').classList.add('hidden');
+    document.getElementById('appRoot').classList.remove('hidden');
+    renderVoiceControls();
+    await loadInitialState();
+    await loadPayments(false);
+    connectWebSocket();
+  }
+
   // --- API HELPER ---
   async function apiFetch(url, options = {}) {
     const headers = Object.assign(
       { 'Content-Type': 'application/json' },
       options.headers || {}
     );
-    if (state.accessPin) {
-      headers['x-access-pin'] = state.accessPin;
+    const resp = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'same-origin'
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 401 && data && data.authRequired) {
+      showLoginScreen();
+      return null;
     }
-    const resp = await fetch(url, { ...options, headers });
-    if (resp.status === 401) {
-      const entered = window.prompt('Este control de pagos tiene PIN de seguridad. Ingresa el PIN:');
-      if (entered !== null) {
-        state.accessPin = entered.trim();
-        localStorage.setItem('bancolombia_access_pin', state.accessPin);
-        return apiFetch(url, options);
-      }
-    }
-    return resp.json();
+    return data;
   }
 
-  // --- FORMATEO DE FECHAS ---
   function formatDateTime(iso) {
     if (!iso) return '';
     try {
@@ -235,7 +260,6 @@
     state.payments = payments;
     state.totalAmount = data.total_amount || 0;
 
-    // Totales
     document.getElementById('summaryPeriodLabel').textContent =
       `TOTAL RECIBIDO (${(data.periodLabel || 'HOY').toUpperCase()})`;
     document.getElementById('heroTotalAmount').textContent =
@@ -247,7 +271,6 @@
     document.getElementById('bottomCountText').textContent =
       `${payments.length} pago(s) verificado(s) en ${data.periodLabel || 'el periodo'}`;
 
-    // Último pago recibido
     const latestCard = document.getElementById('latestCard');
     const latestBadge = document.getElementById('latestBadge');
     const latestTimeAgo = document.getElementById('latestTimeAgo');
@@ -297,7 +320,6 @@
       latestMeta.classList.add('hidden');
     }
 
-    // Tabla detallada
     const tbody = document.getElementById('paymentsTableBody');
     if (payments.length === 0) {
       tbody.innerHTML = `
@@ -342,7 +364,6 @@
       .join('');
   }
 
-  // --- CARGA DE DATOS ---
   async function loadInitialState() {
     const res = await apiFetch('/api/state');
     if (!res || !res.ok) return;
@@ -359,13 +380,11 @@
       if (state.customStart) params.set('start', state.customStart);
       if (state.customEnd) params.set('end', state.customEnd);
     }
-    if (state.accessPin) {
-      params.set('pin', state.accessPin);
-    }
     return params.toString();
   }
 
   async function loadPayments(flashLatest = false) {
+    if (!state.authenticated) return;
     const qs = buildPeriodQueryString();
     const res = await apiFetch(`/api/payments?${qs}`);
     if (res && res.ok) {
@@ -373,11 +392,17 @@
     }
   }
 
-  // --- WEBSOCKET TIEMPO REAL ---
+  // --- WEBSOCKET TIEMPO REAL (AUTENTICADO POR COOKIE HTTPONLY) ---
   function connectWebSocket() {
+    if (!state.authenticated) return;
+    if (state.ws) {
+      try {
+        state.ws.close();
+      } catch (_) {}
+    }
+
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const pinParam = state.accessPin ? `?pin=${encodeURIComponent(state.accessPin)}` : '';
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws${pinParam}`);
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
     state.ws = ws;
 
     ws.addEventListener('open', () => {
@@ -414,12 +439,18 @@
       } catch (_) {}
     });
 
-    ws.addEventListener('close', () => {
-      setTimeout(connectWebSocket, 3500);
+    ws.addEventListener('close', (ev) => {
+      if (ev.code === 4001) {
+        showLoginScreen();
+        return;
+      }
+      if (state.authenticated) {
+        state.wsReconnectTimer = setTimeout(connectWebSocket, 3500);
+      }
     });
   }
 
-  // --- MODALES Y EVENTOS DE INTERFAZ ---
+  // --- MODALES ---
   function openSettingsModal() {
     const s = state.settings || {};
     document.getElementById('cfgBusinessName').value = s.business_name || 'Control de Pagos Bancolombia';
@@ -427,13 +458,13 @@
     document.getElementById('cfgImapHost').value = s.imap_host || '';
     document.getElementById('cfgImapPort').value = s.imap_port || '993';
     document.getElementById('cfgEmailUser').value = s.email_user || '';
+    // Jamás se rellena ni expone la clave de aplicación
     document.getElementById('cfgEmailPass').value = '';
     document.getElementById('passSavedHint').textContent = s.has_password
-      ? '✔ Ya hay una contraseña guardada. Déjalo en blanco si no deseas cambiarla.'
+      ? '🔒 Clave de aplicación cifrada con AES-256-GCM y oculta permanentemente. Déjalo vacío para conservarla.'
       : 'Aún no has guardado la contraseña de aplicación.';
     document.getElementById('cfgOfficialSenders').value = s.official_senders || TEST_SENDER_EMAIL;
     document.getElementById('cfgLookback').value = s.sync_lookback || 'today';
-    document.getElementById('cfgPin').value = '';
     document.getElementById('settingsFeedback').classList.add('hidden');
 
     toggleCustomImapVisibility();
@@ -450,10 +481,13 @@
     }
   }
 
-  function collectSettingsForm() {
+  function collectSettingsForm(clearInputAfterRead = false) {
     const s = state.settings || {};
-    const passInput = document.getElementById('cfgEmailPass').value.trim();
-    const pinInput = document.getElementById('cfgPin').value.trim();
+    const passEl = document.getElementById('cfgEmailPass');
+    const passInput = passEl.value.trim();
+    if (clearInputAfterRead) {
+      passEl.value = '';
+    }
 
     return {
       business_name: document.getElementById('cfgBusinessName').value.trim() || 'Control de Pagos Bancolombia',
@@ -464,8 +498,7 @@
       email_user: document.getElementById('cfgEmailUser').value.trim(),
       email_pass: passInput ? passInput : s.has_password ? '__KEEP__' : '',
       official_senders: document.getElementById('cfgOfficialSenders').value.trim(),
-      sync_lookback: document.getElementById('cfgLookback').value,
-      access_pin: pinInput ? pinInput : s.has_pin ? '__KEEP__' : ''
+      sync_lookback: document.getElementById('cfgLookback').value
     };
   }
 
@@ -503,21 +536,70 @@
     window.location.href = `/api/report/pdf?${qs}`;
   }
 
-  // --- INICIALIZACIÓN DE LISTENERS ---
+  // --- INICIALIZACIÓN ---
   document.addEventListener('DOMContentLoaded', async () => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.getVoices();
       window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
     }
 
-    // Desbloquear audio al primer toque en cualquier parte
-    document.body.addEventListener('click', unlockAudio, { once: true });
     document.getElementById('audioUnlockBanner').addEventListener('click', () => {
       unlockAudio();
       speakText('Altavoz activado', true);
     });
 
-    renderVoiceControls();
+    // Formulario de Inicio de Sesión
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      unlockAudio();
+
+      const userEl = document.getElementById('loginUser');
+      const passEl = document.getElementById('loginPass');
+      const errEl = document.getElementById('loginError');
+      const submitBtn = document.getElementById('btnLoginSubmit');
+
+      const username = userEl.value.trim();
+      const password = passEl.value;
+      // Borrar inmediatamente la contraseña del DOM
+      passEl.value = '';
+
+      errEl.classList.add('hidden');
+      submitBtn.disabled = true;
+      submitBtn.textContent = '⏳ Verificando credenciales...';
+
+      try {
+        const resp = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ username, password })
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        if (resp.ok && data.ok) {
+          userEl.value = '';
+          await showAuthenticatedApp();
+        } else {
+          errEl.textContent = data.error || 'Credenciales inválidas.';
+          errEl.classList.remove('hidden');
+        }
+      } catch (_) {
+        errEl.textContent = 'Error de conexión con el servidor.';
+        errEl.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = '🔒 Iniciar Sesión Segura';
+      }
+    });
+
+    // Botón Cerrar Sesión
+    document.getElementById('btnLogout').addEventListener('click', async () => {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin'
+      }).catch(() => {});
+      showLoginScreen();
+    });
 
     // Switch de Voz
     document.getElementById('toggleVoice').addEventListener('change', (e) => {
@@ -544,7 +626,6 @@
       speakText(samplePhrase, true);
     });
 
-    // Botones principales
     document.getElementById('btnOpenSettings').addEventListener('click', openSettingsModal);
     document.getElementById('officialSenderBadge').addEventListener('click', openSettingsModal);
     document.getElementById('btnOpenPhones').addEventListener('click', () => openPhonesModal());
@@ -566,14 +647,12 @@
       }
     });
 
-    // Cerrar modales
     document.querySelectorAll('[data-close]').forEach((btn) => {
       btn.addEventListener('click', () => {
         document.getElementById(btn.dataset.close).classList.add('hidden');
       });
     });
 
-    // Selector adaptador de red QR
     document.getElementById('networkIpSelect').addEventListener('change', (e) => {
       openPhonesModal(e.target.value);
     });
@@ -589,7 +668,6 @@
       } catch (_) {}
     });
 
-    // Presets de remitente oficial
     document.getElementById('cfgProvider').addEventListener('change', toggleCustomImapVisibility);
     document.getElementById('btnPresetTest').addEventListener('click', () => {
       document.getElementById('cfgOfficialSenders').value = TEST_SENDER_EMAIL;
@@ -601,14 +679,13 @@
       document.getElementById('cfgOfficialSenders').value = `${TEST_SENDER_EMAIL}, ${BANCOLOMBIA_OFFICIAL_LIST}`;
     });
 
-    // Probar conexión IMAP
     document.getElementById('btnTestImap').addEventListener('click', async () => {
       const feedback = document.getElementById('settingsFeedback');
       feedback.className = 'alert-msg';
       feedback.textContent = '⏳ Probando conexión con el servidor de correo...';
       feedback.classList.remove('hidden');
 
-      const payload = collectSettingsForm();
+      const payload = collectSettingsForm(false);
       const res = await apiFetch('/api/email/test-connection', {
         method: 'POST',
         body: JSON.stringify(payload)
@@ -617,19 +694,19 @@
       if (res && res.ok) {
         feedback.className = 'alert-msg ok';
         feedback.textContent = `✔ ${res.message}`;
-      } else {
+      } else if (res) {
         feedback.className = 'alert-msg err';
-        feedback.textContent = `✕ ${(res && res.error) || 'No fue posible conectar'}`;
+        feedback.textContent = `✕ ${res.error || 'No fue posible conectar'}`;
       }
     });
 
-    // Guardar configuración
     document.getElementById('settingsForm').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const payload = collectSettingsForm();
+      // Limpia inmediatamente el input tras leerlo para no dejarlo en el DOM
+      const payload = collectSettingsForm(true);
       const feedback = document.getElementById('settingsFeedback');
       feedback.className = 'alert-msg';
-      feedback.textContent = '⏳ Guardando cambios...';
+      feedback.textContent = '⏳ Cifrando y guardando cambios...';
       feedback.classList.remove('hidden');
 
       const res = await apiFetch('/api/settings', {
@@ -643,13 +720,12 @@
         document.getElementById('businessTitle').textContent =
           state.settings.business_name || 'Control de Pagos Bancolombia';
         document.getElementById('modalSettings').classList.add('hidden');
-      } else {
+      } else if (res) {
         feedback.className = 'alert-msg err';
         feedback.textContent = 'Error guardando la configuración.';
       }
     });
 
-    // Simulador de pagos
     document.getElementById('simulateForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       unlockAudio();
@@ -675,7 +751,6 @@
       await loadPayments(false);
     });
 
-    // Filtros de fecha y PDF
     document.querySelectorAll('#periodTabs .tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('#periodTabs .tab-btn').forEach((b) => b.classList.remove('active'));
@@ -701,7 +776,6 @@
     document.getElementById('btnDownloadPdfTop').addEventListener('click', downloadPdfReport);
     document.getElementById('btnDownloadPdfBottom').addEventListener('click', downloadPdfReport);
 
-    // Acciones en la tabla (repetir voz / borrar fila)
     document.getElementById('paymentsTableBody').addEventListener('click', async (e) => {
       const replayBtn = e.target.closest('.btn-replay');
       if (replayBtn) {
@@ -720,7 +794,6 @@
       }
     });
 
-    // Actualizar "Hace X seg" cada 15 segundos
     setInterval(() => {
       const el = document.getElementById('latestTimeAgo');
       if (el && el.dataset.iso) {
@@ -728,8 +801,19 @@
       }
     }, 15000);
 
-    await loadInitialState();
-    await loadPayments(false);
-    connectWebSocket();
+    // Verificar si ya existe cookie de sesión activa al cargar la página
+    try {
+      const sessionResp = await fetch('/api/auth/session', {
+        credentials: 'same-origin'
+      }).then((r) => r.json());
+
+      if (sessionResp && sessionResp.authenticated) {
+        await showAuthenticatedApp();
+      } else {
+        showLoginScreen();
+      }
+    } catch (_) {
+      showLoginScreen();
+    }
   });
 })();
