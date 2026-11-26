@@ -18,7 +18,11 @@
     voiceEnabled: localStorage.getItem('bancolombia_voice_enabled') !== 'false',
     audioUnlocked: false,
     ws: null,
-    wsReconnectTimer: null
+    wsReconnectTimer: null,
+    wsPingInterval: null,
+    wsPongTimeout: null,
+    lastRevision: 0,
+    announcedIds: new Set()
   };
 
   let audioCtx = null;
@@ -104,17 +108,30 @@
   }
 
   // --- GESTIÓN DE VISTAS LOGIN VS DASHBOARD ---
-  function showLoginScreen(customMessage = '') {
-    state.authenticated = false;
+  function clearWsTimers() {
     if (state.wsReconnectTimer) {
       clearTimeout(state.wsReconnectTimer);
       state.wsReconnectTimer = null;
     }
+    if (state.wsPingInterval) {
+      clearInterval(state.wsPingInterval);
+      state.wsPingInterval = null;
+    }
+    if (state.wsPongTimeout) {
+      clearTimeout(state.wsPongTimeout);
+      state.wsPongTimeout = null;
+    }
+  }
+
+  function showLoginScreen(customMessage = '') {
+    state.authenticated = false;
+    clearWsTimers();
     if (state.ws) {
-      try {
-        state.ws.close();
-      } catch (_) {}
+      const oldWs = state.ws;
       state.ws = null;
+      try {
+        oldWs.close();
+      } catch (_) {}
     }
     document.getElementById('appRoot').classList.add('hidden');
     document.getElementById('loginScreen').classList.remove('hidden');
@@ -464,16 +481,58 @@
     const qs = buildPeriodQueryString();
     const res = await apiFetch(`/api/payments?${qs}`);
     if (res && res.ok) {
+      if (typeof res.revision === 'number') {
+        state.lastRevision = res.revision;
+      }
+      for (const p of res.payments || []) {
+        if (p && p.id) state.announcedIds.add(p.id);
+      }
       renderPayments(res, flashLatest);
     }
   }
 
-  // --- WEBSOCKET TIEMPO REAL (AUTENTICADO POR COOKIE HTTPONLY) ---
+  function handleIncomingPaymentLive(payment, announceVoiceFlag, encryptedVault) {
+    if (!payment) return;
+    if (encryptedVault) {
+      localStorage.setItem(VAULT_STORAGE_KEY, encryptedVault);
+    }
+
+    const alreadyAnnounced = state.announcedIds.has(payment.id);
+    state.announcedIds.add(payment.id);
+
+    if (announceVoiceFlag && !alreadyAnnounced) {
+      speakText(payment.voice_phrase, false);
+    }
+
+    if (state.period === 'today' || state.period === '7days' || state.period === 'month' || state.period === 'all') {
+      const exists = state.payments.some((p) => p.id === payment.id);
+      if (!exists) {
+        const updatedList = [payment, ...state.payments];
+        const newTotal = updatedList.reduce((acc, p) => acc + Number(p.amount || 0), 0);
+        renderPayments(
+          {
+            periodLabel: state.period === 'today' ? 'Hoy' : 'Periodo actual',
+            payments: updatedList,
+            total_amount: newTotal,
+            formatted_total: NumberToSpanish.formatCOP(newTotal)
+          },
+          true
+        );
+      }
+    }
+    loadPayments(false);
+  }
+
+  // --- WEBSOCKET TIEMPO REAL CON KEEP-ALIVE BIDIRECCIONAL CADA 15s (EVITA CORTE EN PC POR CLOUDFLARE/RENDER) ---
   function connectWebSocket() {
     if (!state.authenticated) return;
+    clearWsTimers();
+
     if (state.ws) {
+      const prev = state.ws;
+      state.ws = null;
       try {
-        state.ws.close();
+        prev.close();
       } catch (_) {}
     }
 
@@ -482,12 +541,30 @@
     state.ws = ws;
 
     ws.addEventListener('open', () => {
+      if (state.ws !== ws) return;
       ws.send(
         JSON.stringify({
           type: 'hello',
           voiceEnabled: state.voiceEnabled
         })
       );
+
+      // Enviar pulso JSON cada 15s para que Cloudflare/Render jamás congele el WebSocket de PC ni celulares
+      state.wsPingInterval = setInterval(() => {
+        if (state.ws !== ws || ws.readyState !== 1) return;
+        try {
+          ws.send(JSON.stringify({ type: 'ping_app', ts: Date.now() }));
+          if (state.wsPongTimeout) clearTimeout(state.wsPongTimeout);
+          state.wsPongTimeout = setTimeout(() => {
+            if (state.ws === ws && state.authenticated) {
+              connectWebSocket();
+              loadPayments(false);
+            }
+          }, 6000);
+        } catch (_) {
+          connectWebSocket();
+        }
+      }, 15000);
     });
 
     ws.addEventListener('message', (ev) => {
@@ -500,31 +577,22 @@
           );
           return;
         }
+
+        if (state.ws !== ws) return;
+
+        if (msg.type === 'pong_app') {
+          if (state.wsPongTimeout) {
+            clearTimeout(state.wsPongTimeout);
+            state.wsPongTimeout = null;
+          }
+          if (typeof msg.revision === 'number' && state.lastRevision > 0 && msg.revision !== state.lastRevision) {
+            runRealtimeSyncCheck();
+          }
+          return;
+        }
+
         if (msg.type === 'new_payment' && msg.payment) {
-          if (msg.encryptedVault) {
-            localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
-          }
-          if (msg.announceVoice) {
-            speakText(msg.payment.voice_phrase, false);
-          }
-          // Renderizado instantáneo en 0ms sin esperar consulta HTTP adicional
-          if (state.period === 'today' || state.period === '7days' || state.period === 'month' || state.period === 'all') {
-            const exists = state.payments.some((p) => p.id === msg.payment.id);
-            if (!exists) {
-              const updatedList = [msg.payment, ...state.payments];
-              const newTotal = updatedList.reduce((acc, p) => acc + Number(p.amount || 0), 0);
-              renderPayments(
-                {
-                  periodLabel: state.period === 'today' ? 'Hoy' : 'Periodo actual',
-                  payments: updatedList,
-                  total_amount: newTotal,
-                  formatted_total: NumberToSpanish.formatCOP(newTotal)
-                },
-                true
-              );
-            }
-          }
-          loadPayments(false);
+          handleIncomingPaymentLive(msg.payment, Boolean(msg.announceVoice), msg.encryptedVault);
         } else if (msg.type === 'payments_changed') {
           if (msg.encryptedVault) {
             localStorage.setItem(VAULT_STORAGE_KEY, msg.encryptedVault);
@@ -555,20 +623,61 @@
         );
         return;
       }
-      if (ev.code === 4003) {
-        showLoginScreen(
-          '🔒 Tu sesión se trasladó a una pestaña más reciente en este dispositivo.'
-        );
-        return;
-      }
+      if (state.ws !== ws) return;
+
+      clearWsTimers();
       if (ev.code === 4001) {
         showLoginScreen();
         return;
       }
       if (state.authenticated) {
-        state.wsReconnectTimer = setTimeout(connectWebSocket, 3500);
+        state.wsReconnectTimer = setTimeout(() => {
+          connectWebSocket();
+          runRealtimeSyncCheck();
+        }, 1500);
       }
     });
+  }
+
+  // Respaldo activo en tiempo real cada 2.5s: garantiza actualización inmediata en PC y celulares aunque falle el WebSocket
+  let syncCheckInFlight = false;
+  async function runRealtimeSyncCheck() {
+    if (!state.authenticated || syncCheckInFlight) return;
+    syncCheckInFlight = true;
+    try {
+      if (!state.ws || (state.ws.readyState !== 0 && state.ws.readyState !== 1)) {
+        connectWebSocket();
+      }
+
+      const sync = await apiFetch('/api/sync-check');
+      if (!sync || !sync.ok) return;
+
+      if (sync.watcherStatus) {
+        renderWatcherStatus(sync.watcherStatus);
+      }
+      if (Array.isArray(sync.devices) && state.role === 'admin') {
+        renderDevices(sync.devices);
+      }
+
+      if (typeof sync.revision === 'number' && sync.revision !== state.lastRevision) {
+        const wasInitialized = state.lastRevision > 0;
+        state.lastRevision = sync.revision;
+
+        if (
+          wasInitialized &&
+          sync.latestPayment &&
+          !state.announcedIds.has(sync.latestPayment.id)
+        ) {
+          const ageMs = Date.now() - new Date(sync.latestPayment.received_at).getTime();
+          handleIncomingPaymentLive(sync.latestPayment, ageMs < 90000, null);
+        } else {
+          await loadPayments(wasInitialized);
+        }
+      }
+    } catch (_) {
+    } finally {
+      syncCheckInFlight = false;
+    }
   }
 
   // --- MODALES ---
@@ -927,6 +1036,25 @@
         el.textContent = timeAgo(el.dataset.iso);
       }
     }, 15000);
+
+    // Sincronización activa cada 2.5 segundos en todas las sesiones abiertas (PC Admin + Celulares)
+    setInterval(() => {
+      if (state.authenticated) {
+        runRealtimeSyncCheck();
+      }
+    }, 2500);
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.authenticated) {
+        runRealtimeSyncCheck();
+      }
+    });
+
+    window.addEventListener('focus', () => {
+      if (state.authenticated) {
+        runRealtimeSyncCheck();
+      }
+    });
 
     // Keep-alive HTTP cada 8 minutos mientras esté abierto para evitar que Render entre en reposo
     setInterval(() => {

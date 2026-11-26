@@ -136,6 +136,7 @@ function updateSettings(partial, customTimestamp = null) {
 
   if (changedAny) {
     upsert.run('settings_updated_at', String(customTimestamp || Date.now()));
+    bumpRevision();
   }
 
   return getAllSettings(false);
@@ -236,6 +237,9 @@ function restoreEncryptedVault(vaultToken) {
         );
         if (info.changes > 0) restoredPaymentsCount += 1;
       }
+      if (restoredPaymentsCount > 0) {
+        bumpRevision();
+      }
     }
 
     return {
@@ -249,6 +253,23 @@ function restoreEncryptedVault(vaultToken) {
   }
 }
 
+let dataRevision = 1;
+
+function bumpRevision() {
+  dataRevision += 1;
+}
+
+function getDataRevision() {
+  const latest = db
+    .prepare('SELECT id, received_at FROM payments ORDER BY received_at DESC, id DESC LIMIT 1')
+    .get();
+  const countRow = db.prepare('SELECT COUNT(*) AS cnt FROM payments').get();
+  return {
+    revision: dataRevision,
+    totalCount: countRow ? Number(countRow.cnt) : 0,
+    latestId: latest ? Number(latest.id) : 0
+  };
+}
 function enrichPaymentRow(row) {
   if (!row) return null;
   return {
@@ -294,6 +315,7 @@ function insertPayment(payment, isTest = false) {
     nowIso
   );
 
+  bumpRevision();
   return {
     inserted: true,
     payment: getPaymentById(Number(info.lastInsertRowid))
@@ -345,6 +367,7 @@ function deletePayment(id) {
     db.prepare(
       "INSERT INTO settings (key, value) VALUES ('settings_updated_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     ).run(String(Date.now()));
+    bumpRevision();
   }
   return info.changes > 0;
 }
@@ -355,6 +378,7 @@ function clearTestPayments() {
     db.prepare(
       "INSERT INTO settings (key, value) VALUES ('settings_updated_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     ).run(String(Date.now()));
+    bumpRevision();
   }
   return info.changes;
 }
@@ -385,6 +409,7 @@ function listAuditEvents(limit = 25) {
 
 module.exports = {
   DB_PATH,
+  getDataRevision,
   getAllSettings,
   updateSettings,
   exportEncryptedVault,

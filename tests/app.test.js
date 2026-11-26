@@ -369,6 +369,33 @@ test('Seguridad E2E: roles Admin + 2 Celulares (viewer), bloqueo 403, cifrado AE
     assert.equal(alerts[1].payment.sender_email, 'Correo Oficial Verificado');
     assert.equal(alerts[2].payment.sender_email, 'Correo Oficial Verificado');
 
+    // Verificar /api/sync-check tanto en Admin como en Celular
+    const adminSync = await fetch(`${baseUrl}/api/sync-check`, {
+      headers: { Cookie: cookieHeader }
+    }).then((r) => r.json());
+    assert.equal(adminSync.ok, true);
+    assert.equal(adminSync.latestPayment.amount, 85000);
+    assert.equal(Array.isArray(adminSync.devices), true);
+
+    const phoneSync = await fetch(`${baseUrl}/api/sync-check`, {
+      headers: { Cookie: cel1Cookie }
+    }).then((r) => r.json());
+    assert.equal(phoneSync.ok, true);
+    assert.equal(phoneSync.latestPayment.amount, 85000);
+    assert.equal(phoneSync.latestPayment.sender_email, 'Correo Oficial Verificado');
+
+    // Verificar ping_app / pong_app bidireccional en el WebSocket de Admin PC
+    const pongPromise = new Promise((resolve) => {
+      clients[0].on('message', (raw) => {
+        const m = JSON.parse(String(raw));
+        if (m.type === 'pong_app') resolve(m);
+      });
+    });
+    clients[0].send(JSON.stringify({ type: 'ping_app', ts: 12345 }));
+    const pongMsg = await pongPromise;
+    assert.equal(pongMsg.ts, 12345);
+    assert.ok(pongMsg.revision >= 1);
+
     // Verificar que Celular 1 no puede borrar el pago (403)
     const forbiddenDel = await fetch(`${baseUrl}/api/payments/${simRes.payment.id}`, {
       method: 'DELETE',

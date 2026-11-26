@@ -223,7 +223,15 @@ function createAppServer({
   });
 
   app.use(express.json({ limit: '512kb' }));
-  app.use(express.static(path.join(__dirname, 'public')));
+  app.use(
+    express.static(path.join(__dirname, 'public'), {
+      etag: false,
+      maxAge: 0,
+      setHeaders: (res) => {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      }
+    })
+  );
 
   const server = http.createServer(app);
   server.on('connection', (socket) => {
@@ -497,13 +505,30 @@ function createAppServer({
       endIso: range.endIso,
       limit: 1000
     });
+    const revInfo = db.getDataRevision();
     res.json({
       ok: true,
+      revision: revInfo.revision,
       ...range,
       count: data.count,
       total_amount: data.total_amount,
       formatted_total: data.formatted_total,
       payments: data.payments.map((p) => sanitizePaymentForRole(p, role))
+    });
+  });
+
+  // Canal ligero de verificación en tiempo real para garantizar actualización en PC y celulares aunque un proxy corte WebSockets
+  app.get('/api/sync-check', requireAuth, (req, res) => {
+    const role = req.userSession.payload.role;
+    const revInfo = db.getDataRevision();
+    const latestPayment = revInfo.latestId ? db.getPaymentById(revInfo.latestId) : null;
+
+    res.json({
+      ok: true,
+      ...revInfo,
+      latestPayment: latestPayment ? sanitizePaymentForRole(latestPayment, role) : null,
+      watcherStatus: sanitizeWatcherStatusForRole(emailWatcher.getStatus(), role),
+      devices: role === 'admin' ? getDevicesList() : undefined
     });
   });
 
@@ -753,19 +778,24 @@ function createAppServer({
         ? 'Android'
         : 'PC';
 
-    // Si la misma cuenta abre otra pestaña o reconecta, cerrar el socket viejo para garantizar 1 sola conexión viva por usuario
+    // Si otra sesión DISTINTA del mismo usuario estaba conectada, expulsarla con 4002;
+    // si es la misma sesión reconectando su socket, limpiar silenciosamente el socket anterior con 4000
     for (const [oldId, oldEntry] of connectedClients.entries()) {
       if (oldEntry.accountId === verified.accountId) {
         try {
-          if (oldEntry.sessionToken !== token && oldEntry.ws.readyState === 1) {
-            oldEntry.ws.send(
-              JSON.stringify({
-                type: 'session_replaced',
-                message: '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
-              })
-            );
+          if (oldEntry.sessionToken !== token) {
+            if (oldEntry.ws.readyState === 1) {
+              oldEntry.ws.send(
+                JSON.stringify({
+                  type: 'session_replaced',
+                  message: '🔒 Tu sesión se cerró porque este usuario inició sesión en otro navegador o dispositivo.'
+                })
+              );
+            }
+            oldEntry.ws.close(4002, 'Sesión iniciada en otro navegador');
+          } else {
+            oldEntry.ws.close(4000, 'Socket renovado');
           }
-          oldEntry.ws.close(oldEntry.sessionToken !== token ? 4002 : 4003, 'Reemplazada por conexión más reciente');
         } catch (_) {}
         connectedClients.delete(oldId);
       }
@@ -792,12 +822,25 @@ function createAppServer({
     });
 
     ws.on('message', (raw) => {
+      clientEntry.isAlive = true;
       if (!security.verifySessionToken(clientEntry.sessionToken)) {
         ws.close(4001, 'Sesión expirada');
         return;
       }
       try {
         const msg = JSON.parse(String(raw));
+        if (msg.type === 'ping_app') {
+          if (ws.readyState === 1) {
+            ws.send(
+              JSON.stringify({
+                type: 'pong_app',
+                ts: msg.ts,
+                ...db.getDataRevision()
+              })
+            );
+          }
+          return;
+        }
         if (msg.type === 'hello' || msg.type === 'update_device') {
           if (typeof msg.voiceEnabled === 'boolean') {
             clientEntry.voiceEnabled = msg.voiceEnabled;
